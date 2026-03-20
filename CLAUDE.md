@@ -48,10 +48,6 @@ python -m cognitive_memory.server
 - `COGNITIVE_MEMORY_DB` — SQLite database path (default: `~/.cognitive-memory/memory.db`)
 - `COGNITIVE_MEMORY_CONFIG` — config YAML override path (default: bundled `config.default.yaml`)
 
-## Known Issues
-
-- **SQLite locking**: Single `sqlite3.connect()` with no connection pooling or timeout. Concurrent MCP calls can deadlock. This is the active bug being investigated.
-
 ## Rules
 
 - Every storage write must maintain FTS5 sync (insert into `memory_fts` on create, delete+re-insert on content update, delete on memory delete)

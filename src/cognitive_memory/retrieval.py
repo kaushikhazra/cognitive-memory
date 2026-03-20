@@ -182,22 +182,8 @@ def recall(
     penalized.sort(key=lambda x: x[1], reverse=True)
     top_k = penalized[:limit]
 
-    # === Reinforce Write-Back ===
+    # === Reinforce Write-Back + Spreading Activation (single transaction) ===
     growth_factor = config.get("decay.growth_factor", 2.0)
-    for mid, _ in top_k:
-        mem = storage.get_memory(mid)
-        if mem is None:
-            continue
-        r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-        new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
-        storage.update_memory_fields(
-            mid,
-            stability=new_stability,
-            last_accessed=now,
-            access_count=mem.access_count + 1,
-        )
-
-    # === Spreading Activation ===
     activation_strength = config.get("spreading_activation.activation_strength", 0.3)
     spread_factor = config.get("spreading_activation.spread_factor", 0.5)
     max_depth = config.get("spreading_activation.max_depth", 3)
@@ -212,16 +198,30 @@ def recall(
             visited=set(m for m, _ in top_k),
         )
 
-    # Apply stability boosts
-    if stability_updates:
-        bulk = []
-        for neighbor_id, boost in stability_updates.items():
-            mem = storage.get_memory(neighbor_id)
-            if mem and mem.state.value == "active":
-                new_s = decay_mod.apply_spreading_boost(mem.stability, boost)
-                bulk.append((new_s, neighbor_id))
-        if bulk:
-            storage.bulk_update_stability(bulk)
+    with storage.transaction():
+        for mid, _ in top_k:
+            mem = storage.get_memory(mid)
+            if mem is None:
+                continue
+            r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+            new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
+            storage.update_memory_fields(
+                mid,
+                stability=new_stability,
+                last_accessed=now,
+                access_count=mem.access_count + 1,
+            )
+
+        # Apply spreading activation stability boosts
+        if stability_updates:
+            bulk = []
+            for neighbor_id, boost in stability_updates.items():
+                mem = storage.get_memory(neighbor_id)
+                if mem and mem.state.value == "active":
+                    new_s = decay_mod.apply_spreading_boost(mem.stability, boost)
+                    bulk.append((new_s, neighbor_id))
+            if bulk:
+                storage.bulk_update_stability(bulk)
 
     # === Build Results ===
     results: list[RecallResult] = []

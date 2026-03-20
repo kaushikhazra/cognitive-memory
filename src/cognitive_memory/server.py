@@ -242,6 +242,11 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    return await asyncio.to_thread(_handle_tool, name, arguments)
+
+
+def _handle_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Synchronous tool handler — runs in a thread to avoid blocking the event loop."""
     start = time.time()
     engine = _get_engine()
 
