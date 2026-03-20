@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -29,10 +30,12 @@ class Storage:
 
     def __init__(self, db_path: str = ":memory:"):
         self._db_path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.row_factory = sqlite3.Row
+        self._in_transaction = False
         self._run_migrations()
 
     def close(self) -> None:
@@ -41,6 +44,29 @@ class Storage:
     @property
     def connection(self) -> sqlite3.Connection:
         return self._conn
+
+    # --- Transaction Management ---
+
+    @contextmanager
+    def transaction(self):
+        """Context manager for atomic operation groups. Nestable (inner is no-op)."""
+        if self._in_transaction:
+            yield  # Already in a transaction, let the outer one handle commit/rollback
+            return
+        self._in_transaction = True
+        try:
+            yield
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._in_transaction = False
+
+    def _auto_commit(self) -> None:
+        """Commit only if not inside a transaction() block."""
+        if not self._in_transaction:
+            self._conn.commit()
 
     # --- Migration Runner ---
 
@@ -86,7 +112,7 @@ class Storage:
             "INSERT INTO memory_fts(rowid, content) VALUES ((SELECT rowid FROM memory WHERE id = ?), ?)",
             (memory.id, memory.content),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def get_memory(self, memory_id: str) -> Memory | None:
         row = self._conn.execute("SELECT * FROM memory WHERE id = ?", (memory_id,)).fetchone()
@@ -125,14 +151,14 @@ class Storage:
                 "INSERT INTO memory_fts(rowid, content) VALUES ((SELECT rowid FROM memory WHERE id = ?), ?)",
                 (memory_id, fields["content"]),
             )
-        self._conn.commit()
+        self._auto_commit()
 
     def update_embedding(self, memory_id: str, embedding_bytes: bytes) -> None:
         self._conn.execute(
             "UPDATE memory SET embedding = ? WHERE id = ?",
             (embedding_bytes, memory_id),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def delete_memory(self, memory_id: str) -> None:
         # Cascade: relationships, versions, FTS, then memory
@@ -146,7 +172,7 @@ class Storage:
             (memory_id,),
         )
         self._conn.execute("DELETE FROM memory WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        self._auto_commit()
 
     def list_memories(
         self,
@@ -241,7 +267,7 @@ class Storage:
             "INSERT INTO memory_version (id, memory_id, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
             (version.id, version.memory_id, version.content, metadata_json, version.created_at.isoformat()),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def get_versions(self, memory_id: str) -> list[MemoryVersion]:
         rows = self._conn.execute(
@@ -264,14 +290,14 @@ class Storage:
             "INSERT OR IGNORE INTO relationship (id, source_id, target_id, rel_type, strength, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (rel.id, rel.source_id, rel.target_id, rel.rel_type.value, rel.strength, rel.created_at.isoformat()),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def delete_relationship(self, source_id: str, target_id: str, rel_type: str) -> bool:
         cursor = self._conn.execute(
             "DELETE FROM relationship WHERE source_id = ? AND target_id = ? AND rel_type = ?",
             (source_id, target_id, rel_type),
         )
-        self._conn.commit()
+        self._auto_commit()
         return cursor.rowcount > 0
 
     def get_relationships_for(self, memory_id: str, rel_types: list[str] | None = None) -> list[Relationship]:
@@ -333,7 +359,7 @@ class Storage:
             "DELETE FROM relationship WHERE source_id = ? AND rel_type = 'relates_to' AND strength < 1.0",
             (memory_id,),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def bulk_update_stability(self, updates: list[tuple[float, str]]) -> None:
         """Batch update stability for multiple memories. updates = [(new_stability, memory_id), ...]"""
@@ -341,7 +367,7 @@ class Storage:
             "UPDATE memory SET stability = ? WHERE id = ?",
             updates,
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def has_incoming_supersedes(self, memory_id: str) -> bool:
         """Check if memory has an active incoming supersedes relationship."""
@@ -375,7 +401,7 @@ class Storage:
             "INSERT INTO consolidation_log (id, action, source_ids, target_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (entry.id, entry.action, json.dumps(entry.source_ids), entry.target_id, entry.reason, entry.created_at.isoformat()),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def get_last_consolidation(self) -> dict | None:
         row = self._conn.execute(
@@ -421,7 +447,7 @@ class Storage:
             "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, ?)",
             (key, json.dumps(value), now),
         )
-        self._conn.commit()
+        self._auto_commit()
 
     def get_all_config(self) -> dict[str, Any]:
         rows = self._conn.execute("SELECT key, value FROM config").fetchall()

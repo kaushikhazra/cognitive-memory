@@ -108,15 +108,11 @@ class MemoryEngine:
             tags=tags or [],
         )
 
-        # Step 6: Store
-        self.storage.insert_memory(memory, embedding_bytes)
-        self.embeddings.add_to_matrix(memory_id, embedding)
-
-        # Step 4: Auto-linking
-        self._auto_link(memory_id, embedding, now)
-
-        # Step 5: Contradiction check
-        self._contradiction_check(memory_id, embedding, content, now)
+        with self.storage.transaction():
+            self.storage.insert_memory(memory, embedding_bytes)
+            self.embeddings.add_to_matrix(memory_id, embedding)
+            self._auto_link(memory_id, embedding, now)
+            self._contradiction_check(memory_id, embedding, content, now)
 
         return memory
 
@@ -215,7 +211,6 @@ class MemoryEngine:
             version.metadata["changed"].append("importance")
         if tags is not None:
             version.metadata["changed"].append("tags")
-        self.storage.insert_version(version)
 
         # Step 2: Apply changes
         fields = {}
@@ -232,8 +227,6 @@ class MemoryEngine:
         if content_changed:
             new_embedding = self.embeddings.embed(content)
             embedding_bytes = self.embeddings.to_bytes(new_embedding)
-            self.storage.update_embedding(memory_id, embedding_bytes)
-            self.embeddings.replace_in_matrix(memory_id, new_embedding)
 
         # Step 4: Reinforce (or reset stability on type change)
         r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
@@ -247,13 +240,16 @@ class MemoryEngine:
         fields["updated_at"] = now
         fields["last_accessed"] = now
 
-        self.storage.update_memory_fields(memory_id, **fields)
-
-        # Step 6: Re-scan auto-links if content changed
-        if content_changed:
-            self.storage.delete_auto_links(memory_id)
-            new_embedding = self.embeddings.embed(content)
-            self._auto_link(memory_id, new_embedding, now)
+        with self.storage.transaction():
+            self.storage.insert_version(version)
+            if content_changed:
+                self.storage.update_embedding(memory_id, embedding_bytes)
+                self.embeddings.replace_in_matrix(memory_id, new_embedding)
+            self.storage.update_memory_fields(memory_id, **fields)
+            if content_changed:
+                self.storage.delete_auto_links(memory_id)
+                new_embedding = self.embeddings.embed(content)
+                self._auto_link(memory_id, new_embedding, now)
 
         return self.storage.get_memory(memory_id)
 
@@ -270,13 +266,14 @@ class MemoryEngine:
         growth_factor = self.config.get("decay.growth_factor", 2.0)
         new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
 
-        self.storage.update_memory_fields(
-            memory_id,
-            state=MemoryState.ACTIVE,
-            last_accessed=now,
-            stability=new_stability,
-            updated_at=now,
-        )
+        with self.storage.transaction():
+            self.storage.update_memory_fields(
+                memory_id,
+                state=MemoryState.ACTIVE,
+                last_accessed=now,
+                stability=new_stability,
+                updated_at=now,
+            )
 
         # Re-add to numpy matrix
         active_embeddings = self.storage.get_active_embeddings()
@@ -293,8 +290,9 @@ class MemoryEngine:
         if mem is None:
             return False
 
-        self.embeddings.remove_from_matrix(memory_id)
-        self.storage.delete_memory(memory_id)
+        with self.storage.transaction():
+            self.embeddings.remove_from_matrix(memory_id)
+            self.storage.delete_memory(memory_id)
         return True
 
     # === Retrieval ===
@@ -363,11 +361,13 @@ class MemoryEngine:
             strength=strength,
             created_at=now,
         )
-        self.storage.insert_relationship(rel)
+        with self.storage.transaction():
+            self.storage.insert_relationship(rel)
         return rel
 
     def delete_relationship(self, source_id: str, target_id: str, rel_type: str) -> bool:
-        return self.storage.delete_relationship(source_id, target_id, rel_type)
+        with self.storage.transaction():
+            return self.storage.delete_relationship(source_id, target_id, rel_type)
 
     def get_related(
         self,
@@ -413,7 +413,8 @@ class MemoryEngine:
         if mem is None or mem.state == MemoryState.ARCHIVED:
             return False
         now = datetime.now(timezone.utc)
-        self.storage.update_memory_fields(memory_id, state=MemoryState.ARCHIVED, updated_at=now)
+        with self.storage.transaction():
+            self.storage.update_memory_fields(memory_id, state=MemoryState.ARCHIVED, updated_at=now)
         self.embeddings.remove_from_matrix(memory_id)
         return True
 
@@ -497,4 +498,5 @@ class MemoryEngine:
         return self.config.get_all()
 
     def set_config(self, key: str, value) -> None:
-        self.config.set(key, value)
+        with self.storage.transaction():
+            self.config.set(key, value)

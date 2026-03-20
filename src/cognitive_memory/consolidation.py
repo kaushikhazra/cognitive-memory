@@ -32,42 +32,43 @@ def consolidate(
     now = datetime.now(timezone.utc)
     actions: list[dict] = []
 
-    # Stage 1: Decay Update
-    active_memories = storage.get_all_active_memories()
-    if not dry_run:
-        for mem in active_memories:
-            r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-            storage.update_memory_fields(mem.id, retrievability=r)
+    with storage.transaction():
+        # Stage 1: Decay Update
+        active_memories = storage.get_all_active_memories()
+        if not dry_run:
+            for mem in active_memories:
+                r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+                storage.update_memory_fields(mem.id, retrievability=r)
 
-    # Stage 2: Promotion Pass
-    # Re-fetch after decay update
-    active_memories = storage.get_all_active_memories()
-    promotion_actions = _promotion_pass(active_memories, storage, config, now, dry_run)
-    actions.extend(promotion_actions)
+        # Stage 2: Promotion Pass
+        # Re-fetch after decay update
+        active_memories = storage.get_all_active_memories()
+        promotion_actions = _promotion_pass(active_memories, storage, config, now, dry_run)
+        actions.extend(promotion_actions)
 
-    # Stage 3: Archive Pass
-    forget_threshold = config.get("decay.thresholds.forgotten", 0.2)
-    active_memories = storage.get_all_active_memories()  # re-fetch post-promotion
-    archive_actions = _archive_pass(active_memories, storage, embeddings, config, now, forget_threshold, dry_run)
-    actions.extend(archive_actions)
+        # Stage 3: Archive Pass
+        forget_threshold = config.get("decay.thresholds.forgotten", 0.2)
+        active_memories = storage.get_all_active_memories()  # re-fetch post-promotion
+        archive_actions = _archive_pass(active_memories, storage, embeddings, config, now, forget_threshold, dry_run)
+        actions.extend(archive_actions)
 
-    # Stage 4+5: Cluster Scan + Merge Pass
-    active_memories = storage.get_all_active_memories()  # re-fetch post-archive
-    merge_actions = _cluster_and_merge(active_memories, storage, embeddings, config, now, dry_run)
-    actions.extend(merge_actions)
+        # Stage 4+5: Cluster Scan + Merge Pass
+        active_memories = storage.get_all_active_memories()  # re-fetch post-archive
+        merge_actions = _cluster_and_merge(active_memories, storage, embeddings, config, now, dry_run)
+        actions.extend(merge_actions)
 
-    # Stage 6: Log
-    if not dry_run:
-        for action in actions:
-            entry = ConsolidationLogEntry(
-                id=str(uuid.uuid4()),
-                action=action["action"],
-                source_ids=action.get("source_ids", []),
-                target_id=action.get("target_id"),
-                reason=action.get("reason", ""),
-                created_at=now,
-            )
-            storage.insert_consolidation_log(entry)
+        # Stage 6: Log
+        if not dry_run:
+            for action in actions:
+                entry = ConsolidationLogEntry(
+                    id=str(uuid.uuid4()),
+                    action=action["action"],
+                    source_ids=action.get("source_ids", []),
+                    target_id=action.get("target_id"),
+                    reason=action.get("reason", ""),
+                    created_at=now,
+                )
+                storage.insert_consolidation_log(entry)
 
     return actions
 
