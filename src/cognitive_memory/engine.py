@@ -29,22 +29,16 @@ from .models import (
     StatsResponse,
     ToolResponse,
 )
-from .storage import Storage
+from .surreal_storage import SurrealStorage
 
 
 class MemoryEngine:
     """Central orchestrator for the cognitive memory system."""
 
-    def __init__(self, db_path: str = ":memory:", config_path: Path | None = None):
-        self.storage = Storage(db_path)
+    def __init__(self, db_path: str = "mem://", config_path: Path | None = None):
+        self.storage = SurrealStorage(db_path)
         self.config = Config(storage=self.storage, config_path=config_path)
         self.embeddings = EmbeddingService()
-        self._load_embedding_matrix()
-
-    def _load_embedding_matrix(self) -> None:
-        """Load all active embeddings into the in-memory numpy matrix."""
-        active_embeddings = self.storage.get_active_embeddings()
-        self.embeddings.load_matrix(active_embeddings)
 
     def close(self) -> None:
         self.storage.close()
@@ -67,9 +61,8 @@ class MemoryEngine:
         # Step 1: Classification
         if memory_type:
             mem_type = MemoryType(memory_type)
-            confidence = 1.0
         else:
-            mem_type, confidence = classify(content, source)
+            mem_type, _ = classify(content, source)
 
         # Step 2: Importance scoring
         importance_cfg = {
@@ -86,7 +79,7 @@ class MemoryEngine:
 
         # Step 3: Embedding
         embedding = self.embeddings.embed(content)
-        embedding_bytes = self.embeddings.to_bytes(embedding)
+        embedding_list = embedding.astype(float).tolist()
 
         # Initial decay values
         s0 = decay_mod.get_initial_stability(mem_type.value)
@@ -108,20 +101,22 @@ class MemoryEngine:
             tags=tags or [],
         )
 
-        with self.storage.transaction():
-            self.storage.insert_memory(memory, embedding_bytes)
-            self.embeddings.add_to_matrix(memory_id, embedding)
-            self._auto_link(memory_id, embedding, now)
-            self._contradiction_check(memory_id, embedding, content, now)
+        self.storage.insert_memory(memory, embedding_list)
+
+        # Step 4: Auto-linking
+        self._auto_link(memory_id, embedding_list, now)
+
+        # Step 5: Contradiction check
+        self._contradiction_check(memory_id, embedding_list, content, now)
 
         return memory
 
-    def _auto_link(self, memory_id: str, embedding: np.ndarray, now: datetime) -> None:
+    def _auto_link(self, memory_id: str, embedding: list[float], now: datetime) -> None:
         """Find similar active memories and create relates_to links."""
         threshold = self.config.get("auto_linking.similarity_threshold", 0.75)
         max_links = self.config.get("auto_linking.max_links", 5)
 
-        results = self.embeddings.cosine_search(embedding, top_k=max_links + 1)
+        results = self.storage.vector_search(embedding, top_k=max_links + 1)
         linked = 0
         for mid, score in results:
             if mid == memory_id:
@@ -136,20 +131,20 @@ class MemoryEngine:
                 source_id=memory_id,
                 target_id=mid,
                 rel_type=RelType.RELATES_TO,
-                strength=score,  # cosine score as strength (< 1.0 = auto-created)
+                strength=score,
                 created_at=now,
             )
             self.storage.insert_relationship(rel)
             linked += 1
 
-    def _contradiction_check(self, memory_id: str, embedding: np.ndarray, content: str, now: datetime) -> None:
+    def _contradiction_check(self, memory_id: str, embedding: list[float], content: str, now: datetime) -> None:
         """Check for contradictions with existing memories."""
         threshold = self.config.get("contradiction.similarity_threshold", 0.80)
         negation_signals = self.config.get("contradiction.negation_signals", [
             "not", "never", "no longer", "changed", "wrong", "actually",
         ])
 
-        results = self.embeddings.cosine_search(embedding, top_k=10)
+        results = self.storage.vector_search(embedding, top_k=10)
         for mid, score in results:
             if mid == memory_id:
                 continue
@@ -191,7 +186,7 @@ class MemoryEngine:
         content_changed = content is not None and content != mem.content
         type_changed = memory_type is not None and memory_type != mem.memory_type.value
 
-        # Step 1: Version snapshot
+        # Version snapshot
         version = MemoryVersion(
             id=str(uuid.uuid4()),
             memory_id=memory_id,
@@ -211,8 +206,9 @@ class MemoryEngine:
             version.metadata["changed"].append("importance")
         if tags is not None:
             version.metadata["changed"].append("tags")
+        self.storage.insert_version(version)
 
-        # Step 2: Apply changes
+        # Apply changes
         fields = {}
         if content is not None:
             fields["content"] = content
@@ -223,12 +219,12 @@ class MemoryEngine:
         if tags is not None:
             fields["tags"] = tags
 
-        # Step 3: Re-embed if content changed
+        # Re-embed if content changed
         if content_changed:
             new_embedding = self.embeddings.embed(content)
-            embedding_bytes = self.embeddings.to_bytes(new_embedding)
+            self.storage.update_embedding(memory_id, new_embedding.astype(float).tolist())
 
-        # Step 4: Reinforce (or reset stability on type change)
+        # Reinforce (or reset stability on type change)
         r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
         if type_changed:
             fields["stability"] = decay_mod.get_initial_stability(memory_type)
@@ -236,20 +232,16 @@ class MemoryEngine:
             growth_factor = self.config.get("decay.growth_factor", 2.0)
             fields["stability"] = decay_mod.reinforce(mem.stability, r, growth_factor)
 
-        # Step 5: Timestamps
         fields["updated_at"] = now
         fields["last_accessed"] = now
 
-        with self.storage.transaction():
-            self.storage.insert_version(version)
-            if content_changed:
-                self.storage.update_embedding(memory_id, embedding_bytes)
-                self.embeddings.replace_in_matrix(memory_id, new_embedding)
-            self.storage.update_memory_fields(memory_id, **fields)
-            if content_changed:
-                self.storage.delete_auto_links(memory_id)
-                new_embedding = self.embeddings.embed(content)
-                self._auto_link(memory_id, new_embedding, now)
+        self.storage.update_memory_fields(memory_id, **fields)
+
+        # Re-scan auto-links if content changed
+        if content_changed:
+            self.storage.delete_auto_links(memory_id)
+            new_embedding = self.embeddings.embed(content)
+            self._auto_link(memory_id, new_embedding.astype(float).tolist(), now)
 
         return self.storage.get_memory(memory_id)
 
@@ -266,19 +258,13 @@ class MemoryEngine:
         growth_factor = self.config.get("decay.growth_factor", 2.0)
         new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
 
-        with self.storage.transaction():
-            self.storage.update_memory_fields(
-                memory_id,
-                state=MemoryState.ACTIVE,
-                last_accessed=now,
-                stability=new_stability,
-                updated_at=now,
-            )
-
-        # Re-add to numpy matrix
-        active_embeddings = self.storage.get_active_embeddings()
-        if memory_id in active_embeddings:
-            self.embeddings.add_to_matrix(memory_id, active_embeddings[memory_id])
+        self.storage.update_memory_fields(
+            memory_id,
+            state=MemoryState.ACTIVE,
+            last_accessed=now,
+            stability=new_stability,
+            updated_at=now,
+        )
 
         return self.storage.get_memory(memory_id)
 
@@ -289,10 +275,7 @@ class MemoryEngine:
         mem = self.storage.get_memory(memory_id)
         if mem is None:
             return False
-
-        with self.storage.transaction():
-            self.embeddings.remove_from_matrix(memory_id)
-            self.storage.delete_memory(memory_id)
+        self.storage.delete_memory(memory_id)
         return True
 
     # === Retrieval ===
@@ -321,9 +304,8 @@ class MemoryEngine:
 
         now = datetime.now(timezone.utc)
         r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-        mem.retrievability = r  # on-the-fly
+        mem.retrievability = r
 
-        # Relationships
         rels = self.storage.get_relationships_for(mem.id)
         rel_infos = []
         for rel in rels:
@@ -338,7 +320,6 @@ class MemoryEngine:
                     strength=rel.strength, direction="incoming",
                 ))
 
-        # Versions
         versions = self.storage.get_versions(mem.id)
 
         return MemoryGetResponse(memory=mem, relationships=rel_infos, versions=versions)
@@ -361,13 +342,11 @@ class MemoryEngine:
             strength=strength,
             created_at=now,
         )
-        with self.storage.transaction():
-            self.storage.insert_relationship(rel)
+        self.storage.insert_relationship(rel)
         return rel
 
     def delete_relationship(self, source_id: str, target_id: str, rel_type: str) -> bool:
-        with self.storage.transaction():
-            return self.storage.delete_relationship(source_id, target_id, rel_type)
+        return self.storage.delete_relationship(source_id, target_id, rel_type)
 
     def get_related(
         self,
@@ -413,20 +392,13 @@ class MemoryEngine:
         if mem is None or mem.state == MemoryState.ARCHIVED:
             return False
         now = datetime.now(timezone.utc)
-        with self.storage.transaction():
-            self.storage.update_memory_fields(memory_id, state=MemoryState.ARCHIVED, updated_at=now)
-        self.embeddings.remove_from_matrix(memory_id)
+        self.storage.update_memory_fields(memory_id, state=MemoryState.ARCHIVED, updated_at=now)
         return True
 
     def archive_bulk(self, memory_ids: list[str]) -> int:
-        count = 0
-        for mid in memory_ids:
-            if self.archive_memory(mid):
-                count += 1
-        return count
+        return sum(1 for mid in memory_ids if self.archive_memory(mid))
 
     def archive_below_retrievability(self, threshold: float) -> int:
-        """Archive memories with on-the-fly R below threshold."""
         now = datetime.now(timezone.utc)
         active = self.storage.get_all_active_memories()
         count = 0
@@ -451,7 +423,6 @@ class MemoryEngine:
         counts_by_type = self.storage.get_counts_by_type()
         counts_by_state = self.storage.get_counts_by_state()
 
-        # Compute on-the-fly R for decay stats
         active = self.storage.get_all_active_memories()
         r_by_type: dict[str, list[float]] = {}
         fading_count = 0
@@ -469,7 +440,6 @@ class MemoryEngine:
                 fading_count += 1
 
         avg_r = {t: sum(rs) / len(rs) if rs else 0.0 for t, rs in r_by_type.items()}
-
         consolidation_summary = self.storage.get_consolidation_summary()
 
         return {
@@ -486,7 +456,6 @@ class MemoryEngine:
             "storage": {
                 "db_size_bytes": self.storage.get_db_size(),
                 "memory_count": self.storage.get_total_memory_count(),
-                "embedding_matrix_mb": self.embeddings.get_matrix_size_mb(),
             },
         }
 
@@ -498,5 +467,4 @@ class MemoryEngine:
         return self.config.get_all()
 
     def set_config(self, key: str, value) -> None:
-        with self.storage.transaction():
-            self.config.set(key, value)
+        self.config.set(key, value)

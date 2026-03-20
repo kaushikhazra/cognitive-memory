@@ -19,7 +19,7 @@ from .models import (
 if TYPE_CHECKING:
     from .config import Config
     from .embeddings import EmbeddingService
-    from .storage import Storage
+    from .surreal_storage import SurrealStorage as Storage
 
 
 def consolidate(
@@ -32,43 +32,41 @@ def consolidate(
     now = datetime.now(timezone.utc)
     actions: list[dict] = []
 
-    with storage.transaction():
-        # Stage 1: Decay Update
-        active_memories = storage.get_all_active_memories()
-        if not dry_run:
-            for mem in active_memories:
-                r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-                storage.update_memory_fields(mem.id, retrievability=r)
+    # Stage 1: Decay Update
+    active_memories = storage.get_all_active_memories()
+    if not dry_run:
+        for mem in active_memories:
+            r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+            storage.update_memory_fields(mem.id, retrievability=r)
 
-        # Stage 2: Promotion Pass
-        # Re-fetch after decay update
-        active_memories = storage.get_all_active_memories()
-        promotion_actions = _promotion_pass(active_memories, storage, config, now, dry_run)
-        actions.extend(promotion_actions)
+    # Stage 2: Promotion Pass
+    active_memories = storage.get_all_active_memories()
+    promotion_actions = _promotion_pass(active_memories, storage, config, now, dry_run)
+    actions.extend(promotion_actions)
 
-        # Stage 3: Archive Pass
-        forget_threshold = config.get("decay.thresholds.forgotten", 0.2)
-        active_memories = storage.get_all_active_memories()  # re-fetch post-promotion
-        archive_actions = _archive_pass(active_memories, storage, embeddings, config, now, forget_threshold, dry_run)
-        actions.extend(archive_actions)
+    # Stage 3: Archive Pass
+    forget_threshold = config.get("decay.thresholds.forgotten", 0.2)
+    active_memories = storage.get_all_active_memories()
+    archive_actions = _archive_pass(active_memories, storage, embeddings, config, now, forget_threshold, dry_run)
+    actions.extend(archive_actions)
 
-        # Stage 4+5: Cluster Scan + Merge Pass
-        active_memories = storage.get_all_active_memories()  # re-fetch post-archive
-        merge_actions = _cluster_and_merge(active_memories, storage, embeddings, config, now, dry_run)
-        actions.extend(merge_actions)
+    # Stage 4+5: Cluster Scan + Merge Pass
+    active_memories = storage.get_all_active_memories()
+    merge_actions = _cluster_and_merge(active_memories, storage, embeddings, config, now, dry_run)
+    actions.extend(merge_actions)
 
-        # Stage 6: Log
-        if not dry_run:
-            for action in actions:
-                entry = ConsolidationLogEntry(
-                    id=str(uuid.uuid4()),
-                    action=action["action"],
-                    source_ids=action.get("source_ids", []),
-                    target_id=action.get("target_id"),
-                    reason=action.get("reason", ""),
-                    created_at=now,
-                )
-                storage.insert_consolidation_log(entry)
+    # Stage 6: Log
+    if not dry_run:
+        for action in actions:
+            entry = ConsolidationLogEntry(
+                id=str(uuid.uuid4()),
+                action=action["action"],
+                source_ids=action.get("source_ids", []),
+                target_id=action.get("target_id"),
+                reason=action.get("reason", ""),
+                created_at=now,
+            )
+            storage.insert_consolidation_log(entry)
 
     return actions
 
@@ -168,7 +166,6 @@ def _archive_pass(
 
             if not dry_run:
                 storage.update_memory_fields(mem.id, state=MemoryState.ARCHIVED, updated_at=now)
-                embeddings.remove_from_matrix(mem.id)
 
     return actions
 
@@ -188,86 +185,64 @@ def _cluster_and_merge(
         "not", "never", "no longer", "changed", "wrong", "actually", "incorrect", "false",
     ])
 
-    # Get embeddings for all active memories
-    active_embeddings = storage.get_active_embeddings()
-    if len(active_embeddings) < 2:
+    # Use vector search per memory to find similar pairs
+    if len(memories) < 2:
         return actions
 
-    # Build pairs above merge threshold
-    ids = list(active_embeddings.keys())
     merged_ids: set[str] = set()
+    seen_pairs: set[tuple[str, str]] = set()
 
-    for i in range(len(ids)):
-        if ids[i] in merged_ids:
+    for mem in memories:
+        if mem.id in merged_ids:
             continue
-        for j in range(i + 1, len(ids)):
-            if ids[j] in merged_ids:
+        # Find similar memories via vector search
+        similar = storage.vector_search_for_memory(mem.id, top_k=10)
+        for other_id, sim in similar:
+            if other_id == mem.id or other_id in merged_ids:
+                continue
+            pair = tuple(sorted([mem.id, other_id]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            if sim < contradiction_threshold:
                 continue
 
-            sim = embeddings.cosine_similarity_pair(
-                active_embeddings[ids[i]], active_embeddings[ids[j]]
-            )
+            mem_b = storage.get_memory(other_id)
+            if mem_b is None:
+                continue
 
-            if sim >= merge_threshold:
-                mem_a = storage.get_memory(ids[i])
-                mem_b = storage.get_memory(ids[j])
-                if mem_a is None or mem_b is None:
-                    continue
+            has_negation = _has_negation_signals(mem.content, mem_b.content, negation_signals)
 
-                # Check for contradiction
-                has_negation = _has_negation_signals(mem_a.content, mem_b.content, negation_signals)
-
-                if has_negation:
-                    # Flag contradiction, don't merge
-                    action = {
-                        "action": "flag_contradiction",
-                        "source_ids": [mem_a.id, mem_b.id],
-                        "reason": f"Similarity={sim:.3f}, negation signals detected",
-                    }
-                    actions.append(action)
-
-                    if not dry_run:
-                        _create_contradicts(storage, mem_a.id, mem_b.id, sim, now)
+            if sim >= merge_threshold and not has_negation:
+                # Merge
+                score_a = mem.importance * mem.access_count
+                score_b = mem_b.importance * mem_b.access_count
+                if score_a >= score_b:
+                    primary, secondary = mem, mem_b
                 else:
-                    # Merge
-                    score_a = mem_a.importance * mem_a.access_count
-                    score_b = mem_b.importance * mem_b.access_count
-                    if score_a >= score_b:
-                        primary, secondary = mem_a, mem_b
-                    else:
-                        primary, secondary = mem_b, mem_a
+                    primary, secondary = mem_b, mem
 
-                    action = {
-                        "action": "merge",
-                        "source_ids": [primary.id, secondary.id],
-                        "target_id": primary.id,
-                        "reason": f"Similarity={sim:.3f}, merged into {primary.id}",
-                    }
-                    actions.append(action)
+                actions.append({
+                    "action": "merge",
+                    "source_ids": [primary.id, secondary.id],
+                    "target_id": primary.id,
+                    "reason": f"Similarity={sim:.3f}, merged into {primary.id}",
+                })
 
-                    if not dry_run:
-                        _execute_merge(storage, embeddings, primary, secondary, now)
+                if not dry_run:
+                    _execute_merge(storage, embeddings, primary, secondary, now)
+                merged_ids.add(secondary.id)
 
-                    merged_ids.add(secondary.id)
-
-            elif sim >= contradiction_threshold:
-                # Check for contradiction at lower threshold
-                mem_a = storage.get_memory(ids[i])
-                mem_b = storage.get_memory(ids[j])
-                if mem_a is None or mem_b is None:
-                    continue
-
-                has_negation = _has_negation_signals(mem_a.content, mem_b.content, negation_signals)
-                if has_negation:
-                    action = {
-                        "action": "flag_contradiction",
-                        "source_ids": [mem_a.id, mem_b.id],
-                        "reason": f"Similarity={sim:.3f}, negation signals detected",
-                    }
-                    actions.append(action)
-
-                    if not dry_run:
-                        _create_contradicts(storage, mem_a.id, mem_b.id, sim, now)
+            elif has_negation:
+                # Flag contradiction
+                actions.append({
+                    "action": "flag_contradiction",
+                    "source_ids": [mem.id, mem_b.id],
+                    "reason": f"Similarity={sim:.3f}, negation signals detected",
+                })
+                if not dry_run:
+                    _create_contradicts(storage, mem.id, mem_b.id, sim, now)
 
     return actions
 
@@ -303,11 +278,10 @@ def _execute_merge(
 
     # Step 3: Re-embed
     new_embedding = embeddings.embed(merged_content)
-    embedding_bytes = embeddings.to_bytes(new_embedding)
+    embedding_list = new_embedding.astype(float).tolist()
 
     storage.update_memory_fields(primary.id, content=merged_content, updated_at=now)
-    storage.update_embedding(primary.id, embedding_bytes)
-    embeddings.replace_in_matrix(primary.id, new_embedding)
+    storage.update_embedding(primary.id, embedding_list)
 
     # Step 4: Transfer relationships with dedup
     secondary_rels = storage.get_relationships_for(secondary.id)
@@ -359,7 +333,6 @@ def _execute_merge(
 
     # Step 5: Archive secondary with supersedes link
     storage.update_memory_fields(secondary.id, state=MemoryState.ARCHIVED, updated_at=now)
-    embeddings.remove_from_matrix(secondary.id)
 
     supersedes_rel = Relationship(
         id=str(uuid.uuid4()),

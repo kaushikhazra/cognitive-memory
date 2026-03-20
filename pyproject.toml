@@ -14,6 +14,8 @@ dependencies = [
     "numpy>=1.26.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
+    "surrealdb>=0.4.0",
+    "uvicorn>=0.28.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +24,10 @@ dev = [
     "pytest-asyncio>=0.23",
     "hypothesis>=6.0",
 ]
+service = [
+    "pywin32>=306",
+]
 
 [project.scripts]
 cognitive-memory = "cognitive_memory.server:main"
+cognitive-memory-service = "cognitive_memory.service:handle_command_line"

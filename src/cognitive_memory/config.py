@@ -1,4 +1,4 @@
-"""Configuration management — loads defaults from YAML, overrides from SQLite config table."""
+"""Configuration management — loads defaults from YAML, overrides from storage config table."""
 
 from __future__ import annotations
 

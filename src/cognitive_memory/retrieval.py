@@ -13,7 +13,7 @@ from .models import ContradictionInfo, RecallResult
 if TYPE_CHECKING:
     from .config import Config
     from .embeddings import EmbeddingService
-    from .storage import Storage
+    from .surreal_storage import SurrealStorage as Storage
 
 
 def recall(
@@ -38,7 +38,8 @@ def recall(
     # Semantic search
     semantic_results: list[tuple[str, float]] = []
     query_vec = embeddings.embed(query)
-    raw_semantic = embeddings.cosine_search(query_vec, top_k=phase1_n)
+    query_list = query_vec.astype(float).tolist()
+    raw_semantic = storage.vector_search(query_list, top_k=phase1_n)
     # Apply filters
     for mid, score in raw_semantic:
         mem = storage.get_memory(mid)
@@ -198,30 +199,29 @@ def recall(
             visited=set(m for m, _ in top_k),
         )
 
-    with storage.transaction():
-        for mid, _ in top_k:
-            mem = storage.get_memory(mid)
-            if mem is None:
-                continue
-            r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-            new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
-            storage.update_memory_fields(
-                mid,
-                stability=new_stability,
-                last_accessed=now,
-                access_count=mem.access_count + 1,
-            )
+    for mid, _ in top_k:
+        mem = storage.get_memory(mid)
+        if mem is None:
+            continue
+        r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+        new_stability = decay_mod.reinforce(mem.stability, r, growth_factor)
+        storage.update_memory_fields(
+            mid,
+            stability=new_stability,
+            last_accessed=now,
+            access_count=mem.access_count + 1,
+        )
 
-        # Apply spreading activation stability boosts
-        if stability_updates:
-            bulk = []
-            for neighbor_id, boost in stability_updates.items():
-                mem = storage.get_memory(neighbor_id)
-                if mem and mem.state.value == "active":
-                    new_s = decay_mod.apply_spreading_boost(mem.stability, boost)
-                    bulk.append((new_s, neighbor_id))
-            if bulk:
-                storage.bulk_update_stability(bulk)
+    # Apply spreading activation stability boosts
+    if stability_updates:
+        bulk = []
+        for neighbor_id, boost in stability_updates.items():
+            mem = storage.get_memory(neighbor_id)
+            if mem and mem.state.value == "active":
+                new_s = decay_mod.apply_spreading_boost(mem.stability, boost)
+                bulk.append((new_s, neighbor_id))
+        if bulk:
+            storage.bulk_update_stability(bulk)
 
     # === Build Results ===
     results: list[RecallResult] = []
