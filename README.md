@@ -6,12 +6,14 @@ A biologically-inspired cognitive memory system for AI agents, exposed as an [MC
 
 - **Four memory types** with different decay rates — working (hours), episodic (days), semantic (weeks), procedural (months)
 - **FSRS-inspired decay** — retrievability computed on-the-fly: `R(t) = e^(-t / 9S)`
-- **Multi-strategy retrieval** — semantic search, BM25 keyword search, temporal recency, and graph traversal fused with Reciprocal Rank Fusion (RRF)
+- **Multi-strategy retrieval** — semantic search (HNSW cosine), BM25 keyword search, temporal recency, and graph traversal fused with Reciprocal Rank Fusion (RRF)
 - **Spreading activation** — retrieving a memory strengthens its neighbors in the relationship graph
 - **Automatic linking** — new memories are linked to similar existing ones via cosine similarity
 - **Contradiction detection** — flags semantically similar memories with negation signals
-- **Consolidation pipeline** — promotes working→episodic→semantic/procedural, archives forgotten memories, merges near-duplicates
+- **Consolidation pipeline** — promotes working->episodic->semantic/procedural, archives forgotten memories, merges near-duplicates
 - **Version history** — every update creates a snapshot for full audit trail
+- **CLI tool** — browse, search, and manage memories from the terminal
+- **Windows service** — runs as a background service via Task Scheduler (no admin required)
 
 ## Installation
 
@@ -21,35 +23,88 @@ Requires Python 3.11+.
 pip install -e .
 ```
 
-This installs `sentence-transformers` (all-MiniLM-L6-v2, 384 dimensions) for embeddings.
+This installs the MCP server, CLI tool, and all dependencies including `sentence-transformers` (all-MiniLM-L6-v2, 384d) and `SurrealDB` (embedded).
 
-## Usage
+## Quick Start
 
-### As an MCP server
+### 1. Start the server
 
-Add to your Claude Code MCP config:
+```bash
+cognitive-memory
+```
+
+This starts the Streamable HTTP MCP server on `http://127.0.0.1:8050/mcp`.
+
+### 2. Connect from Claude Code
+
+Add to your Claude Code MCP config (`~/.claude.json` or project `.mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "cognitive-memory": {
-      "command": "cognitive-memory",
-      "env": {
-        "COGNITIVE_MEMORY_DB": "~/.cognitive-memory/memory.db"
-      }
+      "command": "npx",
+      "args": ["mcp-remote", "http://127.0.0.1:8050/mcp"]
     }
   }
 }
 ```
 
-### Environment Variables
+### 3. Use the CLI
+
+```bash
+# Search memories
+cognitive-memory-cli recall "python programming"
+
+# Browse
+cognitive-memory-cli list
+cognitive-memory-cli list --type semantic --tags "project,design"
+
+# Get full details
+cognitive-memory-cli get <memory-id>
+
+# Store a memory
+cognitive-memory-cli store "Python's GIL was removed in 3.13" --type semantic --tags "python,news"
+
+# Pipe from stdin
+echo "meeting notes here" | cognitive-memory-cli store -
+
+# System health
+cognitive-memory-cli stats
+cognitive-memory-cli consolidate --dry-run
+
+# JSON output for scripting
+cognitive-memory-cli --json list | jq '.data.memories[].content'
+```
+
+Run `cognitive-memory-cli --help` for all commands and flags.
+
+## Windows Service
+
+Run the server as a background service that auto-starts at logon:
+
+```bash
+cognitive-memory-service install    # Register with Task Scheduler
+cognitive-memory-service start      # Start now
+cognitive-memory-service status     # Check health
+cognitive-memory-service stop       # Stop
+cognitive-memory-service remove     # Uninstall
+cognitive-memory-service debug      # Run in foreground (development)
+```
+
+No admin elevation or pywin32 required. Uses Task Scheduler with auto-restart on failure (3 attempts, 1 minute apart).
+
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COGNITIVE_MEMORY_DB` | `~/.cognitive-memory/memory.db` | SQLite database path |
+| `COGNITIVE_MEMORY_DB` | `~/.cognitive-memory/data` | SurrealDB data directory |
+| `COGNITIVE_MEMORY_PORT` | `8050` | HTTP server port |
+| `COGNITIVE_MEMORY_HOST` | `127.0.0.1` | HTTP server bind address |
 | `COGNITIVE_MEMORY_CONFIG` | bundled `config.default.yaml` | Config YAML override path |
+| `COGNITIVE_MEMORY_URL` | `http://127.0.0.1:8050/mcp` | CLI: server URL (overrides `--url`) |
 
-## MCP Tools
+## MCP Tools (14)
 
 | Tool | Description |
 |------|-------------|
@@ -72,22 +127,25 @@ Add to your Claude Code MCP config:
 
 ```
 cognitive_memory/
-  server.py          MCP stdio server — 14 tools
+  server.py          Streamable HTTP MCP server (FastMCP + uvicorn)
+  cli.py             CLI tool (click, connects via MCP client)
+  service.py         Windows Task Scheduler service management
   engine.py          Central orchestrator
-  storage.py         SQLite with WAL, FTS5, migrations
-  embeddings.py      Sentence-transformers + in-memory numpy matrix
+  surreal_storage.py SurrealDB embedded storage (HNSW vectors, BM25 FTS, graph edges)
+  embeddings.py      Sentence-transformers embedding service
   retrieval.py       Two-phase RRF pipeline with spreading activation
   decay.py           FSRS-inspired decay engine (pure functions)
   consolidation.py   Promotion, archival, clustering, merging
   classification.py  Heuristic type classification + importance scoring
-  config.py          YAML defaults + SQLite overrides
+  config.py          YAML defaults + DB overrides
   models.py          Pydantic domain models
-  migrations/        Numbered migration scripts
+  protocols.py       Storage protocol (typing.Protocol)
+  schema.surql       SurrealDB schema definition
 ```
 
 ## Configuration
 
-All config is in `config.default.yaml` with dot-notation keys. Override at runtime via `memory_config` tool or `COGNITIVE_MEMORY_CONFIG` env var.
+All config uses dot-notation keys. View/set at runtime via `memory_config` tool or `cognitive-memory-cli config`.
 
 Key settings:
 
