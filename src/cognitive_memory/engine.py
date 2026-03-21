@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-
 from . import decay as decay_mod
 from . import retrieval as retrieval_mod
 from . import consolidation as consolidation_mod

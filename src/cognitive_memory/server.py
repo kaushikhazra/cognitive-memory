@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,24 +22,30 @@ mcp = FastMCP(
     stateless_http=True,
 )
 
-# Engine instance — initialized on first use
+# Engine instance — initialized on first use, guarded by lock for concurrent init
 _engine: MemoryEngine | None = None
+_engine_lock = threading.Lock()
 
 
 def _get_engine() -> MemoryEngine:
     global _engine
-    if _engine is None:
+    if _engine is not None:
+        return _engine
+    with _engine_lock:
+        if _engine is not None:
+            return _engine
         db_path = os.environ.get("COGNITIVE_MEMORY_DB", str(Path.home() / ".cognitive-memory" / "data"))
         config_path = os.environ.get("COGNITIVE_MEMORY_CONFIG")
         # Build SurrealDB URL
         if not db_path.startswith(("mem://", "surrealkv://", "file://")):
             Path(db_path).mkdir(parents=True, exist_ok=True)
-            db_path = f"surrealkv://{db_path}"
+            # SurrealDB URL parser requires forward slashes (Windows backslashes break it)
+            db_path = f"surrealkv://{db_path.replace(os.sep, '/')}"
         _engine = MemoryEngine(
             db_path=db_path,
             config_path=Path(config_path) if config_path else None,
         )
-    return _engine
+        return _engine
 
 
 def _response(data: Any = None, elapsed_ms: float = 0, **meta_extra) -> str:
@@ -351,7 +357,7 @@ def get_app():
 def main() -> None:
     """CLI entrypoint — run the HTTP MCP server."""
     import uvicorn
-    port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "52100"))
+    port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "8050"))
     host = os.environ.get("COGNITIVE_MEMORY_HOST", "127.0.0.1")
     uvicorn.run(get_app(), host=host, port=port, log_level="info")
 

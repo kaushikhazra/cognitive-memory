@@ -11,7 +11,7 @@
 │  │  ┌──────────────────────────────────┐   │   │
 │  │  │  FastMCP Streamable HTTP         │   │   │
 │  │  │  POST /mcp  (JSON-RPC 2.0)      │   │   │
-│  │  │  GET  /mcp  (SSE resumption)     │   │   │
+│  │  │  Stateless — no session state    │   │   │
 │  │  └──────────┬───────────────────────┘   │   │
 │  └─────────────┼───────────────────────────┘   │
 │                │                                │
@@ -38,12 +38,12 @@
 └──────────────────────────────────────────────────┘
 
 Claude Code sessions connect via:
-  npx mcp-remote http://127.0.0.1:52100/mcp
+  npx mcp-remote http://127.0.0.1:8050/mcp
 ```
 
 ## Port
 
-`52100` — arbitrary high port, unlikely to collide. Configurable via env var `COGNITIVE_MEMORY_PORT`.
+`8050` — arbitrary high port, unlikely to collide. Configurable via env var `COGNITIVE_MEMORY_PORT`.
 
 ## SurrealDB Schema
 
@@ -125,10 +125,10 @@ DEFINE FIELD target_id  ON consolidation_log TYPE option<string>;
 DEFINE FIELD reason     ON consolidation_log TYPE string;
 DEFINE FIELD created_at ON consolidation_log TYPE datetime;
 
--- Config
-DEFINE TABLE config SCHEMAFULL;
-DEFINE FIELD value      ON config TYPE any;
-DEFINE FIELD updated_at ON config TYPE datetime;
+-- Config (keyed by record ID, e.g., preference:⟨decay.growth_factor⟩)
+DEFINE TABLE preference SCHEMAFULL;
+DEFINE FIELD val        ON preference TYPE any;
+DEFINE FIELD updated_at ON preference TYPE datetime;
 ```
 
 ## Key SurrealQL Patterns
@@ -166,11 +166,27 @@ SELECT ->relates_to->memory.* AS related FROM $memory_id;
 RELATE $source->relates_to->$target SET strength = $strength, created_at = $now;
 ```
 
+## Concurrency Model
+
+```
+Uvicorn (single-worker, async event loop)
+  └─ FastMCP dispatches sync tool handlers to ThreadPoolExecutor
+       └─ Multiple threads call SurrealStorage._db.query() concurrently
+```
+
+**Engine initialization**: `_get_engine()` is guarded by a `threading.Lock` to prevent multiple engines being created during concurrent first-requests. The lock is only held during initialization — subsequent calls are uncontended.
+
+**SurrealDB thread safety**: The Python `surrealdb` SDK's embedded mode (`Surreal("surrealkv://...")`) uses a Rust core with internal locking. The `query()` method is safe to call from multiple threads. No application-level locking or connection pooling is needed for the storage layer.
+
+**Atomicity**: `store_memory()` performs classify → embed → insert → auto-link → contradiction check. These steps are NOT wrapped in a DB transaction. A crash mid-sequence can leave a memory without its auto-links. This is acceptable — the next `consolidate()` run will re-create auto-links for any memory that has an embedding but no `relates_to` edges. Consolidation is the consistency repair mechanism.
+
+**Stop signal integration**: The Windows Service stop event must NOT block the asyncio event loop. `SvcStop` sets `server.should_exit = True` directly — uvicorn checks this flag on its own tick. The `_run_server` coroutine awaits the server task, not a blocking Win32 event. The Win32 stop event is only used as a secondary signal; the primary shutdown path is through uvicorn's built-in graceful shutdown.
+
 ## File Changes
 
 | File | Action | Notes |
 |------|--------|-------|
-| `storage.py` | Replace | New `SurrealStorage` class using surrealdb SDK |
+| `storage.py` | Replace | New `SurrealStorage` class using surrealdb SDK. Implements `StorageProtocol` (typing.Protocol) |
 | `embeddings.py` | Simplify | Remove numpy matrix management, keep embed() only |
 | `retrieval.py` | Rewrite | Use SurrealQL for vector+FTS+graph in fewer queries |
 | `consolidation.py` | Adapt | Use SurrealStorage API, logic stays same |
@@ -183,15 +199,18 @@ RELATE $source->relates_to->$target SET strength = $strength, created_at = $now;
 | `models.py` | Keep | Pydantic models unchanged |
 | `decay.py` | Keep | Pure functions, no storage dependency |
 | `classification.py` | Keep | Pure functions |
-| `config.py` | Adapt | Read from SurrealDB config table |
+| `config.py` | Adapt | Read from SurrealDB `preference` table |
+| `protocols.py` | **New** | `StorageProtocol` — typing.Protocol listing all required storage methods |
 
 ## Windows Service Design
 
 - **Service name**: `CognitiveMemory`
 - **Display name**: `Cognitive Memory MCP Server`
 - **Event loop**: `SelectorEventLoop` (not Proactor — avoids `set_wakeup_fd` crash)
-- **Startup**: Load SurrealDB embedded → load embedding model → start uvicorn
-- **Shutdown**: `server.should_exit = True` → close SurrealDB → exit
+- **Startup (eager warmup)**: Connect SurrealDB embedded → apply schema (fail loudly on errors) → pre-load embedding model → start uvicorn → report SERVICE_RUNNING. The service reports running only after warmup completes — no cold-start timeouts on first MCP request.
+- **Schema application**: Log every DEFINE statement result. On any non-idempotency failure (syntax error, disk issue), log the error and abort startup — do not silently swallow.
+- **Shutdown**: `server.should_exit = True` → uvicorn drains in-flight requests (10s timeout) → close SurrealDB → exit
+- **Failure recovery**: Configure SCM on install: `sc failure CognitiveMemory reset= 86400 actions= restart/5000/restart/10000/restart/30000` — restart after 5s, 10s, 30s; reset failure counter daily.
 - **Logging**: File-based at `~/.cognitive-memory/service.log`
 - **Config**: `~/.cognitive-memory/config.yaml` (same as before)
 - **DB path**: `surrealkv://~/.cognitive-memory/data` (SurrealDB on-disk)
@@ -203,16 +222,41 @@ RELATE $source->relates_to->$target SET strength = $strength, created_at = $now;
   "mcpServers": {
     "cognitive-memory": {
       "command": "npx",
-      "args": ["mcp-remote", "http://127.0.0.1:52100/mcp"]
+      "args": ["mcp-remote", "http://127.0.0.1:8050/mcp"]
     }
   }
 }
 ```
 
+## Migration (SQLite → SurrealDB)
+
+Script: `scripts/migrate_to_surreal.py`
+
+**Process:**
+1. Open source SQLite DB (read-only) and target SurrealDB (surrealkv:// or mem://)
+2. Apply schema to target via `_ensure_schema()`
+3. Migrate in order: config → memories → versions → relationships
+4. Batch size: 100 records per batch, with progress logging (`Migrating memories: 150/423`)
+5. Embedding conversion: SQLite BLOB (`from_bytes`) → Python `list[float]` → stored directly as `array<float>`
+
+**Verification:**
+- After each table: compare source count vs target count
+- Spot-check: load 5 random memories from target and verify content matches source
+- Final: run `memory_stats` tool against the new DB and compare totals
+
+**Idempotency:** The script checks if the target DB already has data. If non-empty, it aborts with a message — user must pass `--force` to wipe and re-migrate. This prevents accidental duplicate imports.
+
+**Rollback:** The script never modifies the source SQLite DB. If migration fails, delete the SurrealDB data directory and re-run. The SQLite DB remains the source of truth until the user manually switches over.
+
+**Error handling:** On any record failure, log the record ID and continue. At the end, report total migrated vs failed. Exit code 0 only if zero failures.
+
 ## Decisions
 
 1. **Embedded SurrealDB, not separate server** — one process to manage, simpler ops, no network hop for DB access.
 2. **One edge table per relationship type** — SurrealDB idiom. Cleaner than a single `relationship` table with type column. Arrow syntax reads naturally: `->supports->memory`.
-3. **Port 52100** — high, memorable, unlikely to collide.
+3. **Port 8050** — high, memorable, unlikely to collide.
 4. **Keep EmbeddingService for embed()** — SurrealDB stores vectors but doesn't generate them. sentence-transformers stays for embedding generation.
 5. **mcp-remote bridge** — Claude Code doesn't natively support HTTP MCP yet. `npx mcp-remote` is the official bridge.
+6. **Stateless HTTP mode** — `stateless_http=True` in FastMCP. This server is tool-only (no subscriptions/notifications), so MCP session state is unnecessary. Each request is self-contained. This simplifies the server and avoids session cleanup/timeout logic.
+7. **Eager warmup on service start** — The embedding model (~90MB) is loaded during service startup, not on first request. This means service start takes longer (30-60s) but guarantees sub-second first-request latency.
+8. **No DB transactions for store_memory** — Multi-step store (insert + embed + auto-link) is not wrapped in a transaction. Orphaned memories (stored but not linked) are repaired by the consolidation pipeline. This avoids long-held transactions that would reduce concurrency.

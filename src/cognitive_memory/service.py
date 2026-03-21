@@ -34,6 +34,23 @@ def _setup_logging() -> logging.Logger:
     return logger
 
 
+def _eager_warmup(logger: logging.Logger) -> None:
+    """Connect SurrealDB, apply schema, pre-load embedding model.
+
+    Called before reporting SERVICE_RUNNING so that the first MCP request
+    is fast and any startup errors fail loudly.
+    """
+    from .server import _get_engine
+
+    logger.info("Eager warmup: initializing engine (SurrealDB + schema)...")
+    engine = _get_engine()
+    logger.info("Eager warmup: SurrealDB connected, schema applied.")
+
+    logger.info("Eager warmup: pre-loading embedding model...")
+    engine.embeddings.warmup()
+    logger.info("Eager warmup: embedding model loaded. Ready to serve.")
+
+
 if HAS_WIN32:
     class CognitiveMemoryService(win32serviceutil.ServiceFramework):
         """Windows Service running the Cognitive Memory MCP server over HTTP."""
@@ -52,7 +69,17 @@ if HAS_WIN32:
         def SvcDoRun(self):
             """Service entry point — runs until SvcStop is called."""
             self.logger.info("Service starting...")
+
+            try:
+                # Eager warmup BEFORE reporting SERVICE_RUNNING
+                _eager_warmup(self.logger)
+            except Exception as e:
+                self.logger.error(f"Warmup failed, aborting: {e}", exc_info=True)
+                self.ReportServiceStatus(win32service.SERVICE_STOPPED)
+                return
+
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+            self.logger.info("Service reported RUNNING.")
 
             try:
                 # Force SelectorEventLoop to avoid ProactorEventLoop signal issue
@@ -70,16 +97,16 @@ if HAS_WIN32:
             self.logger.info("Stop signal received.")
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
             self.is_alive = False
-            win32event.SetEvent(self.stop_event)
             if self.server:
                 self.server.should_exit = True
+            win32event.SetEvent(self.stop_event)
 
         async def _run_server(self):
             """Start uvicorn and wait for stop signal."""
             from uvicorn import Config, Server
             from .server import get_app
 
-            port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "52100"))
+            port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "8050"))
             host = os.environ.get("COGNITIVE_MEMORY_HOST", "127.0.0.1")
 
             config = Config(
@@ -124,6 +151,7 @@ def handle_command_line():
         print("Running in debug mode (foreground)...")
         logger = _setup_logging()
         logger.addHandler(logging.StreamHandler())
+        _eager_warmup(logger)
         from .server import main
         main()
     else:

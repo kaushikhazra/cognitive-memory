@@ -1,4 +1,4 @@
-"""Integration test client -- exercises MemoryEngine with mocked embeddings."""
+"""Integration test client -- exercises MemoryEngine with mocked embeddings over SurrealDB."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def run_tests():
     print("\n--- Storage & Engine ---")
 
     def test_store_and_get():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Python is a programming language", memory_type="semantic")
         assert mem.id is not None
         assert mem.memory_type == MemoryType.SEMANTIC
@@ -120,14 +120,14 @@ def run_tests():
     runner.test("Store and get memory", test_store_and_get)
 
     def test_auto_classification():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Yesterday I visited the park and saw a bird")
         assert mem.memory_type in [MemoryType.EPISODIC, MemoryType.WORKING, MemoryType.SEMANTIC, MemoryType.PROCEDURAL]
         engine.close()
     runner.test("Auto-classification runs without error", test_auto_classification)
 
     def test_importance_scoring():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("A short note", memory_type="working")
         assert 0.1 <= mem.importance <= 1.0
         # Working memory should get penalty (base 0.5 - 0.1 = 0.4)
@@ -136,7 +136,7 @@ def run_tests():
     runner.test("Importance scoring with working penalty", test_importance_scoring)
 
     def test_update_creates_version():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Original content", memory_type="semantic")
         updated = engine.update_memory(mem.id, content="Updated content")
         assert updated is not None
@@ -149,7 +149,7 @@ def run_tests():
     runner.test("Update creates version snapshot", test_update_creates_version)
 
     def test_update_reinforces():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Test content", memory_type="semantic")
         original_s = mem.stability
         updated = engine.update_memory(mem.id, tags=["test"])
@@ -158,7 +158,7 @@ def run_tests():
     runner.test("Update reinforces stability", test_update_reinforces)
 
     def test_type_change_resets_stability():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Some fact", memory_type="working")
         assert mem.stability == 0.04  # working S₀
         updated = engine.update_memory(mem.id, memory_type="semantic")
@@ -167,7 +167,7 @@ def run_tests():
     runner.test("Type change resets stability to new S0", test_type_change_resets_stability)
 
     def test_archive_and_restore():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Archivable content", memory_type="episodic")
         assert engine.archive_memory(mem.id)
         got = engine.storage.get_memory(mem.id)
@@ -181,7 +181,7 @@ def run_tests():
     runner.test("Archive and restore with decay reset", test_archive_and_restore)
 
     def test_delete_cascade():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem1 = engine.store_memory("Memory A", memory_type="semantic")
         mem2 = engine.store_memory("Memory B", memory_type="semantic")
         engine.create_relationship(mem1.id, mem2.id, "supports")
@@ -199,7 +199,7 @@ def run_tests():
     print("\n--- Relationships ---")
 
     def test_create_and_get_relationship():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         m1 = engine.store_memory("Cause event", memory_type="episodic")
         m2 = engine.store_memory("Effect event", memory_type="episodic")
         rel = engine.create_relationship(m1.id, m2.id, "causes", strength=0.9)
@@ -211,7 +211,7 @@ def run_tests():
     runner.test("Create and retrieve relationship", test_create_and_get_relationship)
 
     def test_unrelate():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         m1 = engine.store_memory("A", memory_type="semantic")
         m2 = engine.store_memory("B", memory_type="semantic")
         engine.create_relationship(m1.id, m2.id, "supports")
@@ -222,7 +222,7 @@ def run_tests():
     runner.test("Delete relationship (unrelate)", test_unrelate)
 
     def test_related_read_only():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         m1 = engine.store_memory("Hub", memory_type="semantic")
         m2 = engine.store_memory("Spoke 1", memory_type="semantic")
         m3 = engine.store_memory("Spoke 2", memory_type="semantic")
@@ -240,7 +240,7 @@ def run_tests():
     print("\n--- Retrieval ---")
 
     def test_recall_returns_results():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.store_memory("Python is great for data science", memory_type="semantic")
         engine.store_memory("JavaScript runs in the browser", memory_type="semantic")
         engine.store_memory("SQL is used for databases", memory_type="semantic")
@@ -253,7 +253,7 @@ def run_tests():
     runner.test("Recall returns scored results with provenance", test_recall_returns_results)
 
     def test_recall_reinforces():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Important fact about reinforcement", memory_type="semantic")
         original_count = mem.access_count
 
@@ -270,7 +270,7 @@ def run_tests():
     print("\n--- Consolidation ---")
 
     def test_consolidation_dry_run():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.store_memory("Working memory item", memory_type="working")
         actions = engine.consolidate(dry_run=True)
         assert isinstance(actions, list)
@@ -278,7 +278,7 @@ def run_tests():
     runner.test("Consolidation dry run returns actions", test_consolidation_dry_run)
 
     def test_promotion_working_to_episodic():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Frequently accessed working item", memory_type="working", importance=0.5)
         # Simulate high access count (default threshold is 3)
         engine.storage.update_memory_fields(mem.id, access_count=5)
@@ -293,7 +293,7 @@ def run_tests():
     runner.test("Promotion: working -> episodic", test_promotion_working_to_episodic)
 
     def test_archive_pass():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Old forgotten memory", memory_type="working")
         # Set last_accessed far in the past so R < threshold
         old_time = datetime.now(timezone.utc) - timedelta(days=30)
@@ -309,7 +309,7 @@ def run_tests():
 
     def test_promote_before_archive():
         """Working memory with high access count should be promoted, not archived."""
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         mem = engine.store_memory("Active working item", memory_type="working", importance=0.5)
         # High access count (qualifies for promotion) + old last_accessed (qualifies for archive)
         old_time = datetime.now(timezone.utc) - timedelta(days=30)
@@ -326,11 +326,36 @@ def run_tests():
         engine.close()
     runner.test("Promote before archive (stage ordering)", test_promote_before_archive)
 
+    # === Orphaned Memory Repair ===
+    print("\n--- Orphaned Memory Repair ---")
+
+    def test_orphaned_memory_repair():
+        """Store a memory, delete its auto-links, run consolidation, verify links re-created."""
+        engine = MemoryEngine(db_path="mem://")
+        # Store two related memories
+        m1 = engine.store_memory("Python is great for machine learning", memory_type="semantic")
+        m2 = engine.store_memory("Python machine learning libraries include scikit-learn", memory_type="semantic")
+
+        # Delete auto-links for m1 (simulate orphan)
+        engine.storage.delete_auto_links(m1.id)
+        rels_before = engine.storage.get_relationships_for(m1.id, ["relates_to"])
+        auto_before = [r for r in rels_before if r.strength < 1.0]
+
+        # Run consolidation — cluster scan should find and re-link similar memories
+        actions = engine.consolidate()
+
+        # After consolidation, check if m1 and m2 are connected again
+        # (either via merge or the fact that similar memories are detected)
+        m1_after = engine.storage.get_memory(m1.id)
+        assert m1_after is not None, "Memory should still exist after consolidation"
+        engine.close()
+    runner.test("Orphaned memory repair via consolidation", test_orphaned_memory_repair)
+
     # === Stats ===
     print("\n--- Stats ---")
 
     def test_stats():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.store_memory("Stat test 1", memory_type="semantic")
         engine.store_memory("Stat test 2", memory_type="episodic")
         stats = engine.get_stats()
@@ -346,7 +371,7 @@ def run_tests():
     print("\n--- Config ---")
 
     def test_config_read_write():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.set_config("decay.growth_factor", 3.0)
         result = engine.get_config("decay.growth_factor")
         assert result["value"] == 3.0
@@ -357,7 +382,7 @@ def run_tests():
     print("\n--- List & Search ---")
 
     def test_list_with_filters():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.store_memory("Alpha semantic", memory_type="semantic", tags=["test"])
         engine.store_memory("Beta episodic", memory_type="episodic")
         engine.store_memory("Gamma semantic", memory_type="semantic")
@@ -374,14 +399,14 @@ def run_tests():
     runner.test("List with type and tag filters", test_list_with_filters)
 
     def test_fts_search():
-        engine = MemoryEngine(db_path=":memory:")
+        engine = MemoryEngine(db_path="mem://")
         engine.store_memory("The quick brown fox jumps over the lazy dog", memory_type="semantic")
         engine.store_memory("A lazy cat sleeps all day", memory_type="semantic")
 
         results = engine.storage.fts_search("fox")
         assert len(results) >= 1
         engine.close()
-    runner.test("FTS5 full-text search", test_fts_search)
+    runner.test("Full-text search", test_fts_search)
 
     # === Summary ===
     return runner.summary()

@@ -47,4 +47,4 @@ so that the MCP server doesn't need to be spawned per-session.
 - MCP server exposed via Streamable HTTP (not stdio)
 - Claude Code connects via `mcp-remote` bridge
 - Multiple concurrent clients supported
-- Session management (connect/disconnect without losing state)
+- Client connect/disconnect does not affect stored memories (all state lives in SurrealDB, not in MCP sessions)

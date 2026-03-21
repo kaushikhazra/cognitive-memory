@@ -1,22 +1,26 @@
-"""Test helper — patches the embedding model with a deterministic mock, then runs the MCP server.
+"""Test helper — patches the embedding model with a deterministic mock, then runs the HTTP MCP server.
 
-Spawned as a subprocess by test_mcp_client.py so that sentence-transformers is not required.
+Spawned as a subprocess by test_mcp_client.py. Listens on the port specified
+by COGNITIVE_MEMORY_PORT env var (default: 52199 for tests).
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 # Ensure src is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+# Force in-memory SurrealDB for tests
+os.environ.setdefault("COGNITIVE_MEMORY_DB", "mem://")
+os.environ.setdefault("COGNITIVE_MEMORY_PORT", "52199")
+
 import numpy as np
 
 # Patch the embedding service BEFORE the server imports the engine
 import cognitive_memory.embeddings as emb_module
-
-_original_ensure = emb_module.EmbeddingService._ensure_model
 
 
 class _MockModel:
@@ -41,7 +45,7 @@ def _patched_ensure(self):
 
 emb_module.EmbeddingService._ensure_model = _patched_ensure
 
-# Now import and run the server
+# Now import and run the HTTP server
 from cognitive_memory.server import main
 
 main()

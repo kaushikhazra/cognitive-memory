@@ -39,11 +39,16 @@ def _rid(table: str, record_id: str) -> str:
 
 
 def _extract_id(surreal_id) -> str:
-    """Extract the plain ID string from a SurrealDB RecordID or string."""
+    """Extract the plain ID string from a SurrealDB RecordID or string.
+
+    SurrealDB wraps complex IDs (e.g., UUIDs) in angle brackets: memory:⟨uuid⟩
+    This function strips both the table prefix and angle brackets.
+    """
     s = str(surreal_id)
     if ":" in s:
-        return s.split(":", 1)[1]
-    return s
+        s = s.split(":", 1)[1]
+    # Strip SurrealDB angle brackets (U+27E8 / U+27E9) used for complex record IDs
+    return s.strip("\u27e8\u27e9")
 
 
 def _to_iso(dt: datetime) -> str:
