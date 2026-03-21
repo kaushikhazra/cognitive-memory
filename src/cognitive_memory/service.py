@@ -161,21 +161,60 @@ def _stop() -> None:
         print(f"Failed to stop: {result.stderr.strip()}")
 
 
+def _check_listening(port: int) -> bool:
+    """Check if the server is actually responding on the port."""
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", method="GET")
+        urllib.request.urlopen(req, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True  # 406 = server is up (MCP expects POST)
+    except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        return False
+
+
 def _status() -> None:
-    """Show current status."""
+    """Show current status with operational details."""
+    port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "8050"))
+    host = os.environ.get("COGNITIVE_MEMORY_HOST", "127.0.0.1")
+    db_path = os.environ.get("COGNITIVE_MEMORY_DB", str(Path.home() / ".cognitive-memory" / "data"))
+    log_file = Path.home() / ".cognitive-memory" / "service.log"
+
+    # Task state
     result = subprocess.run(
         ["powershell", "-Command", f"Get-ScheduledTask -TaskName '{TASK_NAME}' | Format-List TaskName,State"],
         capture_output=True, text=True,
     )
     if result.returncode == 0 and result.stdout.strip():
-        print(result.stdout.strip())
+        for line in result.stdout.strip().splitlines():
+            print(line.strip())
     else:
         startup = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
         bat = startup / STARTUP_BAT
         if bat.exists():
-            print(f"Installed via Startup folder: {bat}")
+            print(f"Installed  : Startup folder ({bat})")
         else:
             print("Service not installed.")
+            return
+
+    # Server health
+    listening = _check_listening(port)
+    print(f"Listening  : {'yes' if listening else 'no'}")
+    print(f"Endpoint   : http://{host}:{port}/mcp")
+    print(f"Database   : {db_path}")
+    db_dir = Path(db_path)
+    if db_dir.exists() and db_dir.is_dir():
+        db_size = sum(f.stat().st_size for f in db_dir.rglob("*") if f.is_file())
+        if db_size >= 1024 * 1024:
+            print(f"DB size    : {db_size / (1024 * 1024):.1f} MB")
+        else:
+            print(f"DB size    : {db_size / 1024:.1f} KB")
+    print(f"Log file   : {log_file}")
+    if log_file.exists():
+        log_size = log_file.stat().st_size
+        print(f"Log size   : {log_size / 1024:.1f} KB")
 
 
 def _debug() -> None:
