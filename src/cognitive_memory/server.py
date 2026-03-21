@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -356,10 +357,45 @@ def get_app():
 
 def main() -> None:
     """CLI entrypoint — run the HTTP MCP server."""
+    import logging
     import uvicorn
+
+    # When running headless (pythonw.exe / Task Scheduler), redirect logs to file
+    log_dir = Path.home() / ".cognitive-memory"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = str(log_dir / "service.log")
+
+    if not sys.stdout or not sys.stdout.writable():
+        # Running under pythonw.exe — no console available
+        sys.stdout = open(log_file, "a")
+        sys.stderr = sys.stdout
+
     port = int(os.environ.get("COGNITIVE_MEMORY_PORT", "8050"))
     host = os.environ.get("COGNITIVE_MEMORY_HOST", "127.0.0.1")
-    uvicorn.run(get_app(), host=host, port=port, log_level="info")
+
+    # Pre-initialize the engine so startup errors are caught early
+    _get_engine()
+
+    uvicorn.run(get_app(), host=host, port=port, log_level="info", log_config={
+        "version": 1,
+        "disable_existing_loggers": False,
+        "handlers": {
+            "file": {
+                "class": "logging.FileHandler",
+                "filename": log_file,
+                "formatter": "default",
+            },
+        },
+        "formatters": {
+            "default": {
+                "fmt": "%(asctime)s [%(levelname)s] %(message)s",
+            },
+        },
+        "root": {
+            "level": "INFO",
+            "handlers": ["file"],
+        },
+    })
 
 
 if __name__ == "__main__":
