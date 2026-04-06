@@ -327,6 +327,86 @@ def memory_consolidate(dry_run: bool = False) -> str:
 
 
 @mcp.tool()
+def memory_self(
+    query: str,
+    tags: list[str] | None = None,
+) -> str:
+    """Recall identity memories — the agent's self-knowledge.
+
+    Convenience wrapper over memory_recall with type_filter='identity'.
+    Returns ranked identity memories matching the query.
+    Supports optional tags filter for facet categories (e.g., 'origin', 'values', 'capability').
+    """
+    start = time.time()
+    engine = _get_engine()
+    try:
+        results = engine.recall(
+            query=query, type_filter="identity", tags=tags,
+        )
+        return _response(
+            {"memories": [r.model_dump() for r in results]},
+            (time.time() - start) * 1000,
+        )
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool()
+def memory_who(
+    person: str,
+    query: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Recall what the agent knows about a specific person.
+
+    Matches person:{name} tags (case-insensitive). If no query is provided,
+    uses the person's name as the query to return everything about them ranked
+    by relevance.
+
+    Fallback behavior: if person-typed query returns zero results, re-queries
+    without type_filter but keeps the person tag filter. If still empty, queries
+    with just the person name (no type or tag filter) to handle cold-start
+    scenarios where knowledge exists as episodic/semantic memories.
+    """
+    person_name = person.strip().lower()
+    if not person_name:
+        return _error("person name is required")
+    start = time.time()
+    engine = _get_engine()
+    try:
+        # Build tag filter: person:{name} (lowercase)
+        person_tag = f"person:{person_name}"
+        combined_tags = [person_tag] + (tags or [])
+
+        # If no query provided, use the person's name as the query
+        effective_query = query or person_name
+
+        # Primary: person-typed memories with person tag
+        results = engine.recall(
+            query=effective_query, type_filter="person", tags=combined_tags,
+        )
+
+        # W2 fallback: if no person-typed results, try without type filter
+        if not results:
+            results = engine.recall(
+                query=effective_query, tags=combined_tags,
+            )
+
+        # W2 fallback: if still empty, try with just the person name as query
+        if not results:
+            results = engine.recall(
+                query=effective_query,
+            )
+
+        return _response(
+            {"memories": [r.model_dump() for r in results]},
+            (time.time() - start) * 1000,
+        )
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool()
 def memory_config(
     key: str | None = None,
     value: Any = None,

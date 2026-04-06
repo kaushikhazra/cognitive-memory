@@ -90,6 +90,7 @@ def _promotion_pass(
     e2p_patterns = config.get("consolidation.promotion.episodic_to_procedural.patterns", [
         "how to", "steps", "workflow", "procedure", "when .+ do", "first .+ then",
     ])
+    to_person_access = config.get("consolidation.promotion.to_person.min_access_count", 3)
 
     for mem in memories:
         new_type = None
@@ -105,20 +106,31 @@ def _promotion_pass(
                 reason = f"Working→Episodic: access={mem.access_count}, importance={mem.importance:.2f}, rels={len(rels)}"
 
         elif mem.memory_type == MemoryType.EPISODIC:
-            # Episodic → Procedural (check first, more specific)
-            content_lower = mem.content.lower()
-            pattern_match = any(re.search(p, content_lower) for p in e2p_patterns)
-            if pattern_match and mem.access_count >= e2p_access:
-                new_type = MemoryType.PROCEDURAL
-                reason = f"Episodic→Procedural: access={mem.access_count}, procedural content pattern"
+            # Episodic → Person (check first — most specific, requires person: tag)
+            person_tags = [t for t in mem.tags if t.startswith("person:")]
+            if person_tags and mem.access_count >= to_person_access:
+                new_type = MemoryType.PERSON
+                reason = f"Episodic→Person: access={mem.access_count}, has person tags {person_tags}"
             else:
-                # Episodic → Semantic
-                r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-                if mem.access_count >= e2s_access and r > e2s_r:
-                    # Check if similar episodics exist (evidence of pattern)
-                    # Use the embedding matrix to find similar
-                    new_type = MemoryType.SEMANTIC
-                    reason = f"Episodic→Semantic: access={mem.access_count}, R={r:.2f}"
+                # Episodic → Procedural (check next, more specific than semantic)
+                content_lower = mem.content.lower()
+                pattern_match = any(re.search(p, content_lower) for p in e2p_patterns)
+                if pattern_match and mem.access_count >= e2p_access:
+                    new_type = MemoryType.PROCEDURAL
+                    reason = f"Episodic→Procedural: access={mem.access_count}, procedural content pattern"
+                else:
+                    # Episodic → Semantic
+                    r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+                    if mem.access_count >= e2s_access and r > e2s_r:
+                        new_type = MemoryType.SEMANTIC
+                        reason = f"Episodic→Semantic: access={mem.access_count}, R={r:.2f}"
+
+        elif mem.memory_type == MemoryType.SEMANTIC:
+            # Semantic → Person (requires person: tag)
+            person_tags = [t for t in mem.tags if t.startswith("person:")]
+            if person_tags and mem.access_count >= to_person_access:
+                new_type = MemoryType.PERSON
+                reason = f"Semantic→Person: access={mem.access_count}, has person tags {person_tags}"
 
         if new_type is not None:
             action = {
@@ -153,19 +165,36 @@ def _archive_pass(
     dry_run: bool,
 ) -> list[dict]:
     actions = []
+    person_threshold = config.get("consolidation.person_archive_threshold", 0.05)
 
     for mem in memories:
-        r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
-        if r < forget_threshold:
-            action = {
-                "action": "archive",
-                "source_ids": [mem.id],
-                "reason": f"R={r:.4f} < threshold={forget_threshold}",
-            }
-            actions.append(action)
+        # Identity memories are never auto-archived
+        if mem.memory_type == MemoryType.IDENTITY:
+            continue
 
-            if not dry_run:
-                storage.update_memory_fields(mem.id, state=MemoryState.ARCHIVED, updated_at=now)
+        r = decay_mod.compute_retrievability(mem.last_accessed, mem.stability, now)
+
+        # Person memories use a stricter (lower) threshold — harder to archive
+        if mem.memory_type == MemoryType.PERSON:
+            if r < person_threshold:
+                action = {
+                    "action": "archive",
+                    "source_ids": [mem.id],
+                    "reason": f"R={r:.4f} < person_threshold={person_threshold}",
+                }
+                actions.append(action)
+                if not dry_run:
+                    storage.update_memory_fields(mem.id, state=MemoryState.ARCHIVED, updated_at=now)
+        else:
+            if r < forget_threshold:
+                action = {
+                    "action": "archive",
+                    "source_ids": [mem.id],
+                    "reason": f"R={r:.4f} < threshold={forget_threshold}",
+                }
+                actions.append(action)
+                if not dry_run:
+                    storage.update_memory_fields(mem.id, state=MemoryState.ARCHIVED, updated_at=now)
 
     return actions
 
@@ -215,6 +244,9 @@ def _cluster_and_merge(
             has_negation = _has_negation_signals(mem.content, mem_b.content, negation_signals)
 
             if sim >= merge_threshold and not has_negation:
+                # Identity memories are foundational — never merge or auto-archive them
+                if mem.memory_type == MemoryType.IDENTITY or mem_b.memory_type == MemoryType.IDENTITY:
+                    continue
                 # Merge
                 score_a = mem.importance * mem.access_count
                 score_b = mem_b.importance * mem_b.access_count

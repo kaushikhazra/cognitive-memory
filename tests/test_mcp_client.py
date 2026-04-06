@@ -83,8 +83,8 @@ async def run_mcp_tests():
                 for t in tools.tools:
                     print(f"  - {t.name}")
 
-                assert len(tools.tools) == 14, f"Expected 14 tools, got {len(tools.tools)}"
-                print(f"\nPASS: 14 tools registered")
+                assert len(tools.tools) == 16, f"Expected 16 tools, got {len(tools.tools)}"
+                print(f"\nPASS: 16 tools registered")
 
                 # memory_store
                 result = await session.call_tool("memory_store", {
@@ -222,6 +222,49 @@ async def run_mcp_tests():
                 config_data = json.loads(result.content[0].text)
                 assert config_data["data"]["value"] == 3.0
                 print(f"PASS: memory_config — read back confirms 3.0")
+
+                # memory_self — store identity memory, then recall via memory_self
+                result = await session.call_tool("memory_store", {
+                    "content": "I am Velasari, an AI agent built by Kaushik",
+                    "type": "identity",
+                    "tags": ["name", "origin"],
+                })
+                identity_data = json.loads(result.content[0].text)
+                assert identity_data["success"]
+                identity_id = identity_data["data"]["id"]
+                print(f"PASS: memory_store — identity memory stored")
+
+                result = await session.call_tool("memory_self", {
+                    "query": "who am I",
+                })
+                self_data = json.loads(result.content[0].text)
+                assert self_data["success"]
+                assert len(self_data["data"]["memories"]) > 0
+                print(f"PASS: memory_self — {len(self_data['data']['memories'])} identity memories found")
+
+                # memory_who — store person memory, then recall via memory_who
+                result = await session.call_tool("memory_store", {
+                    "content": "Kaushik prefers explicit error handling over broad try/except",
+                    "type": "person",
+                    "tags": ["person:kaushik", "preferences", "coding-style"],
+                })
+                person_data = json.loads(result.content[0].text)
+                assert person_data["success"]
+                person_id = person_data["data"]["id"]
+                print(f"PASS: memory_store — person memory stored")
+
+                result = await session.call_tool("memory_who", {
+                    "person": "kaushik",
+                    "query": "coding preferences",
+                })
+                who_data = json.loads(result.content[0].text)
+                assert who_data["success"]
+                assert len(who_data["data"]["memories"]) > 0
+                print(f"PASS: memory_who — {len(who_data['data']['memories'])} person memories found")
+
+                # Clean up identity and person memories
+                await session.call_tool("memory_delete", {"id": identity_id, "confirm": True})
+                await session.call_tool("memory_delete", {"id": person_id, "confirm": True})
 
                 # memory_delete
                 result = await session.call_tool("memory_delete", {"id": js_id, "confirm": True})

@@ -14,6 +14,8 @@ class MemoryType(str, enum.Enum):
     EPISODIC = "episodic"
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
+    IDENTITY = "identity"
+    PERSON = "person"
 
 
 class MemoryState(str, enum.Enum):
@@ -29,6 +31,7 @@ class RelType(str, enum.Enum):
     RELATES_TO = "relates_to"
     SUPERSEDES = "supersedes"
     PART_OF = "part_of"
+    DESCRIBES = "describes"
 
 
 class Memory(BaseModel):

@@ -35,6 +35,19 @@ _PROCEDURAL_PATTERNS = [
     r"^\d+\.\s",  # numbered steps
 ]
 
+_IDENTITY_PATTERNS = [
+    r"\b(?:i am|my name is|i was (?:built|created|designed))\b",
+    r"\b(?:my (?:role|purpose|values?|capabilities?|personality|origin|identity))\b",
+    r"\b(?:as an? (?:agent|ai|assistant))\b",
+    r"\b(?:i (?:believe|value|prefer|specialize))\b",
+]
+
+_PERSON_PATTERNS = [
+    r"\bperson:\w+\b",  # explicit person tag in content
+    r"\b(?:(?:he|she|they) (?:is|are|prefers?|likes?|works?))\b",
+    r"\b(?:(?:'s|'s) (?:wife|husband|partner|health|preference|style))\b",
+]
+
 
 def classify(content: str, source: str | None = None) -> tuple[MemoryType, float]:
     """Classify memory content into a type. Returns (type, confidence 0.0-1.0).
@@ -47,6 +60,8 @@ def classify(content: str, source: str | None = None) -> tuple[MemoryType, float
         MemoryType.EPISODIC: 0.0,
         MemoryType.SEMANTIC: 0.0,
         MemoryType.PROCEDURAL: 0.0,
+        MemoryType.IDENTITY: 0.0,
+        MemoryType.PERSON: 0.0,
     }
 
     # Working memory signals
@@ -77,6 +92,18 @@ def classify(content: str, source: str | None = None) -> tuple[MemoryType, float
         if re.search(pattern, content, re.IGNORECASE):
             scores[MemoryType.PROCEDURAL] += 0.25
     scores[MemoryType.PROCEDURAL] = min(scores[MemoryType.PROCEDURAL], 0.8)
+
+    # Identity signals
+    for pattern in _IDENTITY_PATTERNS:
+        if re.search(pattern, content_lower):
+            scores[MemoryType.IDENTITY] += 0.25
+    scores[MemoryType.IDENTITY] = min(scores[MemoryType.IDENTITY], 0.8)
+
+    # Person signals
+    for pattern in _PERSON_PATTERNS:
+        if re.search(pattern, content_lower):
+            scores[MemoryType.PERSON] += 0.25
+    scores[MemoryType.PERSON] = min(scores[MemoryType.PERSON], 0.8)
 
     # Pick the highest
     best_type = max(scores, key=scores.get)  # type: ignore[arg-type]
@@ -129,6 +156,14 @@ def score_importance(
     # Working memory penalty
     if memory_type == MemoryType.WORKING:
         score -= cfg.get("working_penalty", 0.1)
+
+    # Identity bonus — self-knowledge is inherently high-value
+    if memory_type == MemoryType.IDENTITY:
+        score += cfg.get("identity_bonus", 0.2)
+
+    # Person bonus — social knowledge is high-value
+    if memory_type == MemoryType.PERSON:
+        score += cfg.get("person_bonus", 0.15)
 
     # Clamp
     min_val = cfg.get("min", 0.1)

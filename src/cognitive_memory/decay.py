@@ -30,6 +30,8 @@ def get_initial_stability(memory_type: str, config_map: dict[str, float] | None 
         "episodic": 2.0,
         "semantic": 14.0,
         "procedural": 60.0,
+        "identity": 365.0,
+        "person": 90.0,
     }
     if config_map:
         return config_map.get(memory_type, defaults.get(memory_type, 2.0))

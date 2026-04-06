@@ -70,6 +70,8 @@ class MemoryEngine:
             "length_bonus": self.config.get("importance.length_bonus", 0.1),
             "length_threshold": self.config.get("importance.length_threshold", 200),
             "working_penalty": self.config.get("importance.working_penalty", 0.1),
+            "identity_bonus": self.config.get("importance.identity_bonus", 0.2),
+            "person_bonus": self.config.get("importance.person_bonus", 0.15),
             "min": self.config.get("importance.min", 0.1),
             "max": self.config.get("importance.max", 1.0),
         }

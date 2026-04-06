@@ -6,6 +6,7 @@ import sys
 import uuid
 import time
 import math
+import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -407,6 +408,201 @@ def run_tests():
         assert len(results) >= 1
         engine.close()
     runner.test("Full-text search", test_fts_search)
+
+    # === Identity & Person Memory Types ===
+    print("\n--- Identity & Person Memory Types ---")
+
+    def test_store_identity_memory():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "I am Velasari, an AI agent", memory_type="identity",
+            tags=["name", "origin"],
+        )
+        assert mem.memory_type == MemoryType.IDENTITY
+        assert mem.stability == 365.0  # identity S₀
+        assert mem.importance >= 0.7, f"Expected importance >= 0.7 (base 0.5 + identity bonus 0.2), got {mem.importance}"
+        engine.close()
+    runner.test("Store identity memory with correct stability and importance", test_store_identity_memory)
+
+    def test_store_person_memory():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "Kaushik prefers explicit error handling",
+            memory_type="person",
+            tags=["person:kaushik", "preferences"],
+        )
+        assert mem.memory_type == MemoryType.PERSON
+        assert mem.stability == 90.0  # person S₀
+        assert mem.importance >= 0.65, f"Expected importance >= 0.65 (base 0.5 + person bonus 0.15), got {mem.importance}"
+        engine.close()
+    runner.test("Store person memory with correct stability and importance", test_store_person_memory)
+
+    def test_identity_type_change_stability():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory("A fact", memory_type="episodic")
+        assert mem.stability == 2.0
+        updated = engine.update_memory(mem.id, memory_type="identity")
+        assert updated.stability == 365.0  # identity S₀
+        engine.close()
+    runner.test("Type change to identity resets stability to 365", test_identity_type_change_stability)
+
+    def test_recall_identity_filter():
+        engine = MemoryEngine(db_path="mem://")
+        engine.store_memory("I am Velasari", memory_type="identity")
+        engine.store_memory("Python is a language", memory_type="semantic")
+        results = engine.recall("agent identity", type_filter="identity")
+        assert all(r.memory_type == MemoryType.IDENTITY for r in results)
+        engine.close()
+    runner.test("Recall with type_filter=identity returns only identity memories", test_recall_identity_filter)
+
+    def test_recall_person_filter():
+        engine = MemoryEngine(db_path="mem://")
+        engine.store_memory(
+            "Kaushik likes Python", memory_type="person",
+            tags=["person:kaushik"],
+        )
+        engine.store_memory("JavaScript is fast", memory_type="semantic")
+        results = engine.recall("programming", type_filter="person")
+        assert all(r.memory_type == MemoryType.PERSON for r in results)
+        engine.close()
+    runner.test("Recall with type_filter=person returns only person memories", test_recall_person_filter)
+
+    def test_describes_relationship():
+        engine = MemoryEngine(db_path="mem://")
+        m1 = engine.store_memory("Kaushik anchor", memory_type="person", tags=["person:kaushik"])
+        m2 = engine.store_memory("Kaushik prefers SOLID", memory_type="person", tags=["person:kaushik"])
+        rel = engine.create_relationship(m2.id, m1.id, "describes", strength=1.0)
+        assert rel.rel_type.value == "describes"
+        got = engine.get_memory(m2.id)
+        assert any(r.rel_type.value == "describes" for r in got.relationships)
+        engine.close()
+    runner.test("Create describes relationship between person memories", test_describes_relationship)
+
+    # === Identity & Person Consolidation ===
+    print("\n--- Identity & Person Consolidation ---")
+
+    def test_identity_archive_exemption():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory("I am Velasari", memory_type="identity")
+        # Set last_accessed far in the past to ensure R < threshold
+        old_time = datetime.now(timezone.utc) - timedelta(days=3650)  # 10 years
+        engine.storage.update_memory_fields(mem.id, last_accessed=old_time)
+
+        actions = engine.consolidate()
+        archive_actions = [a for a in actions if a["action"] == "archive" and mem.id in a["source_ids"]]
+        assert len(archive_actions) == 0, "Identity memories should never be auto-archived"
+        updated = engine.storage.get_memory(mem.id)
+        assert updated.state == MemoryState.ACTIVE
+        engine.close()
+    runner.test("Identity memories exempt from auto-archival", test_identity_archive_exemption)
+
+    def test_person_archive_threshold():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "Kaushik health info", memory_type="person",
+            tags=["person:kaushik", "health"],
+        )
+        # Set last_accessed so R is between person threshold (0.05) and global threshold (0.2)
+        # With S₀=90, we need R around 0.1 — between 0.05 and 0.2
+        # R = e^(-t / (9*90)) = e^(-t/810); for R=0.1, t = -810 * ln(0.1) ≈ 1865 days
+        # For R=0.15, t = -810 * ln(0.15) ≈ 1538 days — should NOT be archived (R > 0.05)
+        moderate_old = datetime.now(timezone.utc) - timedelta(days=1538)
+        engine.storage.update_memory_fields(mem.id, last_accessed=moderate_old)
+
+        actions = engine.consolidate()
+        archive_actions = [a for a in actions if a["action"] == "archive" and mem.id in a["source_ids"]]
+        assert len(archive_actions) == 0, "Person memories should not be archived when R > person_threshold"
+        updated = engine.storage.get_memory(mem.id)
+        assert updated.state == MemoryState.ACTIVE
+        engine.close()
+    runner.test("Person memories use stricter archive threshold (not archived above 0.05)", test_person_archive_threshold)
+
+    def test_promotion_episodic_to_person():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "Kaushik mentioned he likes tea",
+            memory_type="episodic",
+            tags=["person:kaushik", "preferences"],
+        )
+        # Set access_count above the to_person threshold (default 3)
+        engine.storage.update_memory_fields(mem.id, access_count=5)
+
+        actions = engine.consolidate()
+        promoted = [a for a in actions if a["action"] == "promote" and mem.id in a["source_ids"]]
+        assert len(promoted) > 0, "Episodic memory with person tag and high access should be promoted"
+        updated = engine.storage.get_memory(mem.id)
+        assert updated.memory_type == MemoryType.PERSON, f"Expected PERSON, got {updated.memory_type}"
+        assert updated.stability == 90.0  # person S₀
+        engine.close()
+    runner.test("Promotion: episodic -> person (with person tag)", test_promotion_episodic_to_person)
+
+    def test_promotion_semantic_to_person():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "Kaushik is a software architect with 27 years experience",
+            memory_type="semantic",
+            tags=["person:kaushik", "career"],
+        )
+        engine.storage.update_memory_fields(mem.id, access_count=5)
+
+        actions = engine.consolidate()
+        promoted = [a for a in actions if a["action"] == "promote" and mem.id in a["source_ids"]]
+        assert len(promoted) > 0, "Semantic memory with person tag and high access should be promoted"
+        updated = engine.storage.get_memory(mem.id)
+        assert updated.memory_type == MemoryType.PERSON, f"Expected PERSON, got {updated.memory_type}"
+        engine.close()
+    runner.test("Promotion: semantic -> person (with person tag)", test_promotion_semantic_to_person)
+
+    def test_no_promotion_without_person_tag():
+        engine = MemoryEngine(db_path="mem://")
+        mem = engine.store_memory(
+            "Some episodic fact without person tag",
+            memory_type="episodic",
+        )
+        engine.storage.update_memory_fields(mem.id, access_count=5)
+
+        actions = engine.consolidate()
+        promoted = [a for a in actions if a["action"] == "promote" and mem.id in a["source_ids"]
+                     and a.get("to_type") == "person"]
+        assert len(promoted) == 0, "Should not promote to person without person: tag"
+        engine.close()
+    runner.test("No person promotion without person: tag", test_no_promotion_without_person_tag)
+
+    # === Bug-fix regression tests ===
+    print("\n--- Bug-fix Regressions ---")
+
+    def test_identity_merge_exemption():
+        """B1: Identity memories must survive the consolidation merge pass."""
+        engine = MemoryEngine(db_path="mem://")
+        # Identical content → identical mock embedding → cosine sim = 1.0 → normally triggers merge
+        m1 = engine.store_memory("I am Velasari, built by Kaushik", memory_type="identity")
+        m2 = engine.store_memory("I am Velasari, built by Kaushik", memory_type="identity")
+
+        actions = engine.consolidate()
+
+        # No merge action should target either identity memory
+        merge_actions = [
+            a for a in actions
+            if a["action"] == "merge" and (m1.id in a["source_ids"] or m2.id in a["source_ids"])
+        ]
+        assert len(merge_actions) == 0, "Identity memories should never be merged by consolidation"
+
+        # Both must still be active
+        u1 = engine.storage.get_memory(m1.id)
+        u2 = engine.storage.get_memory(m2.id)
+        assert u1.state == MemoryState.ACTIVE, "First identity memory archived by merge"
+        assert u2.state == MemoryState.ACTIVE, "Second identity memory archived by merge"
+        engine.close()
+    runner.test("B1: Identity memories exempt from consolidation merge", test_identity_merge_exemption)
+
+    def test_memory_who_empty_person_returns_error():
+        """B2: memory_who('') must return an error, not random recall results."""
+        import cognitive_memory.server as server_mod
+        for empty_input in ("", "   ", "\t"):
+            result = json.loads(server_mod.memory_who(empty_input))
+            assert result["success"] is False, f"Expected failure for person={empty_input!r}, got success"
+            assert result["error"], "Error message must be non-empty"
+    runner.test("B2: memory_who with empty person name returns error", test_memory_who_empty_person_returns_error)
 
     # === Summary ===
     return runner.summary()

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from surrealdb import Surreal
 
@@ -30,6 +33,7 @@ REL_TABLES = {
     "relates_to": "relates_to",
     "supersedes": "supersedes",
     "part_of": "part_of",
+    "describes": "describes",
 }
 
 
@@ -98,8 +102,24 @@ class SurrealStorage:
             if clean:
                 try:
                     self._db.query(clean)
-                except Exception:
-                    pass  # DEFINE statements may warn on re-apply
+                except Exception as e:
+                    logger.warning("Schema statement failed: %s — %s", clean[:80], e)
+
+    def _check_result(self, result, operation: str) -> None:
+        """Raise ValueError if a SurrealDB query result signals an error.
+
+        SurrealDB does not always raise Python exceptions on write failures —
+        it returns error strings or dicts with status='ERR' instead.  Callers
+        must explicitly inspect the result after every write.
+        """
+        if isinstance(result, str):
+            raise ValueError(f"SurrealDB {operation} failed: {result}")
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if isinstance(first, dict) and first.get("status") == "ERR":
+                raise ValueError(
+                    f"SurrealDB {operation} failed: {first.get('result', 'unknown error')}"
+                )
 
     def close(self) -> None:
         pass  # Embedded SurrealDB cleans up on GC
@@ -107,7 +127,7 @@ class SurrealStorage:
     # --- Memory CRUD ---
 
     def insert_memory(self, memory: Memory, embedding: list[float] | None = None) -> None:
-        self._db.query(
+        result = self._db.query(
             """CREATE type::thing('memory', $id) SET
                 content = $content,
                 memory_type = $memory_type,
@@ -142,6 +162,7 @@ class SurrealStorage:
                 "embedding": embedding,
             },
         )
+        self._check_result(result, "insert_memory")
 
     def get_memory(self, memory_id: str) -> Memory | None:
         result = self._db.query(
@@ -304,7 +325,7 @@ class SurrealStorage:
     # --- Memory Versions ---
 
     def insert_version(self, version: MemoryVersion) -> None:
-        self._db.query(
+        result = self._db.query(
             """CREATE type::thing('memory_version', $id) SET
                 memory_id = type::thing('memory', $mem_id),
                 content = $content,
@@ -319,6 +340,7 @@ class SurrealStorage:
                 "created_at": version.created_at,
             },
         )
+        self._check_result(result, "insert_version")
 
     def get_versions(self, memory_id: str) -> list[MemoryVersion]:
         result = self._db.query(
@@ -341,7 +363,7 @@ class SurrealStorage:
 
     def insert_relationship(self, rel: Relationship) -> None:
         table = REL_TABLES[rel.rel_type.value]
-        self._db.query(
+        result = self._db.query(
             f"""LET $from = type::thing('memory', $src);
                 LET $to = type::thing('memory', $tgt);
                 RELATE $from->{table}->$to
@@ -353,6 +375,7 @@ class SurrealStorage:
                 "created_at": rel.created_at,
             },
         )
+        self._check_result(result, f"insert_relationship({table})")
 
     def delete_relationship(self, source_id: str, target_id: str, rel_type: str) -> bool:
         table = REL_TABLES[rel_type]
@@ -470,7 +493,7 @@ class SurrealStorage:
     # --- Consolidation Log ---
 
     def insert_consolidation_log(self, entry: ConsolidationLogEntry) -> None:
-        self._db.query(
+        result = self._db.query(
             """CREATE type::thing('consolidation_log', $id) SET
                 action = $action,
                 source_ids = $source_ids,
@@ -487,6 +510,7 @@ class SurrealStorage:
                 "created_at": entry.created_at,
             },
         )
+        self._check_result(result, "insert_consolidation_log")
 
     def get_last_consolidation(self) -> dict | None:
         result = self._db.query(
