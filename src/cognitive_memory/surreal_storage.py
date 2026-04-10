@@ -552,6 +552,178 @@ class SurrealStorage:
                 summary["archived"] = cnt
         return summary
 
+    # --- Health report queries ---
+
+    def get_counts_by_type_and_state(self) -> dict:
+        """Return counts keyed by (memory_type, state) tuples for engine reshaping."""
+        result = self._db.query(
+            "SELECT memory_type, state, count() AS cnt FROM memory GROUP BY memory_type, state"
+        )
+        rows = self._rows(result)
+        return {(r["memory_type"], r["state"]): r["cnt"] for r in rows}
+
+    def get_active_memories_for_decay(self) -> list[dict]:
+        """Fetch active memories with decay-relevant fields only (no embedding blob)."""
+        result = self._db.query(
+            """SELECT id, string::slice(content, 0, 120) AS content_preview,
+                      memory_type, importance, stability, last_accessed, tags
+               FROM memory
+               WHERE state = 'active'"""
+        )
+        rows = self._rows(result)
+        out = []
+        for r in rows:
+            out.append({
+                "id": _extract_id(r["id"]),
+                "content_preview": r.get("content_preview") or "",
+                "memory_type": r["memory_type"],
+                "importance": r["importance"],
+                "stability": r["stability"],
+                "last_accessed": self._parse_dt(r["last_accessed"]),
+                "tags": r.get("tags") or [],
+            })
+        return out
+
+    def get_orphan_untagged(self) -> tuple[list[dict], int]:
+        """Return active memories with no tags: (capped_list[:50], true_count)."""
+        count_result = self._db.query(
+            """SELECT count() AS cnt FROM memory
+               WHERE state = 'active' AND (tags IS NONE OR array::len(tags) = 0)
+               GROUP ALL"""
+        )
+        count_rows = self._rows(count_result)
+        true_count = count_rows[0].get("cnt", 0) if count_rows else 0
+
+        list_result = self._db.query(
+            """SELECT id, string::slice(content, 0, 120) AS content_preview,
+                      memory_type, created_at
+               FROM memory
+               WHERE state = 'active' AND (tags IS NONE OR array::len(tags) = 0)
+               ORDER BY created_at ASC
+               LIMIT 51"""
+        )
+        rows = self._rows(list_result)
+        items = [
+            {
+                "id": _extract_id(r["id"]),
+                "content_preview": r.get("content_preview") or "",
+                "memory_type": r["memory_type"],
+                "created_at": self._parse_dt(r["created_at"]).isoformat(),
+            }
+            for r in rows
+        ]
+        return (items[:50], true_count)
+
+    def get_orphan_unconnected(self) -> tuple[list[dict], int]:
+        """Return active memories with no relationships in any edge table: (capped_list[:50], true_count).
+
+        Uses two separate queries (count then list) with inline subqueries instead of LET,
+        because the embedded SurrealDB Python SDK returns None for LET-based multi-statement
+        queries, making the LET approach unreliable in tests and embedded deployments.
+        """
+        _EDGE_IDS = """array::distinct(array::flatten([
+            (SELECT VALUE in  FROM causes),
+            (SELECT VALUE out FROM causes),
+            (SELECT VALUE in  FROM follows),
+            (SELECT VALUE out FROM follows),
+            (SELECT VALUE in  FROM contradicts),
+            (SELECT VALUE out FROM contradicts),
+            (SELECT VALUE in  FROM supports),
+            (SELECT VALUE out FROM supports),
+            (SELECT VALUE in  FROM relates_to),
+            (SELECT VALUE out FROM relates_to),
+            (SELECT VALUE in  FROM supersedes),
+            (SELECT VALUE out FROM supersedes),
+            (SELECT VALUE in  FROM part_of),
+            (SELECT VALUE out FROM part_of),
+            (SELECT VALUE in  FROM describes),
+            (SELECT VALUE out FROM describes)
+        ]))"""
+
+        count_result = self._db.query(
+            f"SELECT count() AS cnt FROM memory "
+            f"WHERE state = 'active' AND id NOT IN {_EDGE_IDS} GROUP ALL"
+        )
+        count_rows = self._rows(count_result)
+        if count_rows and isinstance(count_rows[0], dict):
+            true_count = count_rows[0].get("cnt", 0)
+        else:
+            true_count = 0
+
+        if true_count == 0:
+            return ([], 0)
+
+        list_result = self._db.query(
+            f"SELECT id, string::slice(content, 0, 120) AS content_preview, "
+            f"memory_type, tags, created_at "
+            f"FROM memory "
+            f"WHERE state = 'active' AND id NOT IN {_EDGE_IDS} "
+            f"ORDER BY created_at ASC LIMIT 51"
+        )
+        list_rows = self._rows(list_result)
+
+        items = [
+            {
+                "id": _extract_id(r["id"]),
+                "content_preview": r.get("content_preview") or "",
+                "memory_type": r["memory_type"],
+                "tags": r.get("tags") or [],
+                "created_at": self._parse_dt(r["created_at"]).isoformat(),
+            }
+            for r in list_rows if isinstance(r, dict) and "id" in r
+        ]
+        return (items[:50], true_count)
+
+    def get_tag_frequencies(self) -> list[list[str]]:
+        """Return all active memory tag arrays; engine flattens and counts (D7)."""
+        result = self._db.query(
+            "SELECT tags FROM memory WHERE state = 'active'"
+        )
+        rows = self._rows(result)
+        return [r.get("tags") or [] for r in rows]
+
+    def get_health_consolidation_summary(self) -> dict | None:
+        """Return last consolidation run summary grouped by UTC date.
+
+        Named distinctly from get_last_consolidation() to avoid collision (D3).
+        Returns None when consolidation_log is empty (never run).
+        Engine is responsible for wrapping None into the never_run shape (D4).
+        """
+        result = self._db.query(
+            "SELECT * FROM consolidation_log ORDER BY created_at DESC LIMIT 500"
+        )
+        rows = self._rows(result)
+        if not rows:
+            return None
+
+        # Group rows by UTC date — same date = same run (no run_id column, D8)
+        most_recent_date: str | None = None
+        last_run_at: datetime | None = None
+        action_counts: dict[str, int] = {}
+
+        for r in rows:
+            dt = self._parse_dt(r["created_at"])
+            dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            date_str = dt_utc.date().isoformat()
+
+            if most_recent_date is None:
+                most_recent_date = date_str
+                last_run_at = dt_utc
+
+            if date_str == most_recent_date:
+                action = r.get("action", "")
+                action_counts[action] = action_counts.get(action, 0) + 1
+
+        return {
+            "last_run_at": last_run_at.isoformat() if last_run_at else None,
+            "last_run_summary": {
+                "promote": action_counts.get("promote", 0),
+                "archive": action_counts.get("archive", 0),
+                "merge": action_counts.get("merge", 0),
+                "flag_contradiction": action_counts.get("flag_contradiction", 0),
+            },
+        }
+
     # --- Config ---
 
     def get_config(self, key: str) -> Any | None:

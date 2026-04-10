@@ -407,6 +407,23 @@ def memory_who(
 
 
 @mcp.tool()
+def memory_health() -> str:
+    """Return a diagnostic health report for the memory store.
+
+    Includes: memory counts by type and state, at-risk decay list,
+    orphan detection (untagged and unconnected), storage gaps, and
+    consolidation history. Read-only — no side effects.
+    """
+    start = time.time()
+    engine = _get_engine()
+    try:
+        report = engine.get_health()
+        return _response(report, (time.time() - start) * 1000)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool()
 def memory_config(
     key: str | None = None,
     value: Any = None,

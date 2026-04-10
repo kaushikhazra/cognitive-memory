@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import mean
 from typing import Optional
 
 from . import decay as decay_mod
@@ -28,6 +30,139 @@ from .models import (
     ToolResponse,
 )
 from .surreal_storage import SurrealStorage
+
+# --- Health report private helpers (module-level, not class methods) ---
+
+_ALL_MEMORY_TYPES = ["working", "episodic", "semantic", "procedural", "identity", "person"]
+
+
+def _build_totals(counts_raw: dict) -> dict:
+    """Reshape (type, state) count dict into the totals section of the health report.
+
+    Ensures all 6 memory types are always present, defaulting to 0 (US-1.1).
+    counts_raw keys are (memory_type_str, state_str) tuples.
+    """
+    by_type: dict[str, dict[str, int]] = {t: {"active": 0, "archived": 0} for t in _ALL_MEMORY_TYPES}
+
+    for (mem_type, state), cnt in counts_raw.items():
+        if mem_type in by_type and state in ("active", "archived"):
+            by_type[mem_type][state] = cnt
+
+    total_active = sum(v["active"] for v in by_type.values())
+    total_archived = sum(v["archived"] for v in by_type.values())
+
+    return {
+        "by_type": by_type,
+        "by_state": {"active": total_active, "archived": total_archived},
+        "total": total_active + total_archived,
+    }
+
+
+def _build_decay_report(active_memories: list[dict], now: datetime) -> dict:
+    """Compute fresh retrievability for every active memory and build the decay section.
+
+    - at_risk: memories with R < 0.3, identity excluded (D2, D4), sorted ascending by R, capped at 50 (D6)
+    - by_type: per-type averages; types with zero active members get null averages (US-2.2)
+    """
+    AT_RISK_THRESHOLD = 0.3
+    IDENTITY_TYPE = "identity"
+
+    at_risk_all: list[dict] = []
+    by_type_buckets: dict[str, dict[str, list]] = defaultdict(lambda: {"imp": [], "stab": [], "ret": []})
+
+    for mem in active_memories:
+        r = decay_mod.compute_retrievability(mem["last_accessed"], mem["stability"], now)
+        t = mem["memory_type"]
+        by_type_buckets[t]["imp"].append(mem["importance"])
+        by_type_buckets[t]["stab"].append(mem["stability"])
+        by_type_buckets[t]["ret"].append(r)
+
+        if r < AT_RISK_THRESHOLD and t != IDENTITY_TYPE:
+            at_risk_all.append({
+                "id": mem["id"],
+                "content_preview": mem["content_preview"],
+                "memory_type": t,
+                "retrievability": round(r, 4),
+                "last_accessed": mem["last_accessed"].isoformat(),
+                "stability": mem["stability"],
+                "tags": mem["tags"],
+            })
+
+    at_risk_all.sort(key=lambda x: x["retrievability"])
+
+    by_type_summary: dict[str, dict] = {}
+    for mem_type, buckets in by_type_buckets.items():
+        if buckets["ret"]:
+            by_type_summary[mem_type] = {
+                "avg_importance": round(mean(buckets["imp"]), 4),
+                "avg_stability": round(mean(buckets["stab"]), 4),
+                "avg_retrievability": round(mean(buckets["ret"]), 4),
+                "count": len(buckets["ret"]),
+            }
+
+    # Backfill types absent from active memories with null averages (US-2.2)
+    for mem_type in _ALL_MEMORY_TYPES:
+        if mem_type not in by_type_summary:
+            by_type_summary[mem_type] = {
+                "avg_importance": None,
+                "avg_stability": None,
+                "avg_retrievability": None,
+                "count": 0,
+            }
+
+    return {
+        "at_risk": at_risk_all[:50],
+        "at_risk_count": len(at_risk_all),
+        "by_type": by_type_summary,
+    }
+
+
+def _build_gaps(totals: dict, tag_rows: list[list[str]], untagged_count: int) -> dict:
+    """Identify storage gaps: empty types, sparse types, and tag coverage.
+
+    - empty_types: types with zero active memories (all excluded types included)
+    - sparse_types: types with < 5% of total active, identity excluded (D3)
+    - tag_coverage: top-20 tags + unique count, using Counter flatten (D7)
+    """
+    SPARSE_THRESHOLD_PCT = 5.0
+    EXCLUDED_FROM_SPARSE = {"identity"}
+
+    total_active = totals["by_state"]["active"]
+    empty_types = [t for t, v in totals["by_type"].items() if v["active"] == 0]
+
+    sparse_types = []
+    for mem_type, counts in totals["by_type"].items():
+        if mem_type in EXCLUDED_FROM_SPARSE:
+            continue
+        active = counts["active"]
+        if active == 0:
+            continue  # already in empty_types
+        pct = (active / total_active * 100) if total_active > 0 else 0.0
+        if pct < SPARSE_THRESHOLD_PCT:
+            sparse_types.append({
+                "type": mem_type,
+                "active_count": active,
+                "pct_of_active": round(pct, 1),
+            })
+
+    # Flatten tag arrays and count (D7) — no SurrealDB aggregation complexity
+    counter = Counter(tag for tags in tag_rows for tag in tags if tag)
+    total_unique = len(counter)
+    top_tags = sorted(
+        [{"tag": t, "count": c} for t, c in counter.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:20]
+
+    return {
+        "empty_types": empty_types,
+        "sparse_types": sparse_types,
+        "tag_coverage": {
+            "untagged_count": untagged_count,
+            "top_tags": top_tags,
+            "total_unique_tags": total_unique,
+        },
+    }
 
 
 class MemoryEngine:
@@ -457,6 +592,54 @@ class MemoryEngine:
                 "db_size_bytes": self.storage.get_db_size(),
                 "memory_count": self.storage.get_total_memory_count(),
             },
+        }
+
+    # === Health ===
+
+    def get_health(self) -> dict:
+        """Return a full diagnostic health report for the memory store.
+
+        Pure read-only — no side effects. Assembles six storage queries,
+        computes fresh retrievability in Python (D1), and returns a structured
+        report dict ready for the MCP tool response (D9).
+        """
+        now = datetime.now(timezone.utc)
+
+        # 1. Counts by type and state
+        counts_raw = self.storage.get_counts_by_type_and_state()
+        totals = _build_totals(counts_raw)
+
+        # 2. Decay — fetch active memories, compute fresh retrievability
+        active_memories = self.storage.get_active_memories_for_decay()
+        decay_report = _build_decay_report(active_memories, now)
+
+        # 3. Orphans
+        untagged, untagged_count = self.storage.get_orphan_untagged()
+        unconnected, unconnected_count = self.storage.get_orphan_unconnected()
+
+        # 4. Storage gaps
+        tag_rows = self.storage.get_tag_frequencies()
+        gaps = _build_gaps(totals, tag_rows, untagged_count)
+
+        # 5. Consolidation — engine owns the None→never_run shape (D4)
+        consolidation = self.storage.get_health_consolidation_summary()
+        if consolidation is None:
+            consolidation = {"never_run": True, "last_run_at": None, "last_run_summary": None}
+        else:
+            consolidation["never_run"] = False
+
+        return {
+            "generated_at": now.isoformat(),
+            "totals": totals,
+            "decay": decay_report,
+            "orphans": {
+                "no_tags": untagged,
+                "no_tags_count": untagged_count,
+                "no_relations": unconnected,
+                "no_relations_count": unconnected_count,
+            },
+            "gaps": gaps,
+            "consolidation": consolidation,
         }
 
     # === Config ===
